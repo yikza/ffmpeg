@@ -65,6 +65,7 @@ enum FlvTagType {
 enum {
     FLV_STREAM_TYPE_VIDEO,
     FLV_STREAM_TYPE_AUDIO,
+    FLV_STREAM_TYPE_SUBTITLE,
     FLV_STREAM_TYPE_DATA,
     FLV_STREAM_TYPE_NB,
 };
@@ -109,7 +110,6 @@ enum {
     FLV_CODECID_H264    = 7,
     FLV_CODECID_REALH263= 8,
     FLV_CODECID_MPEG4   = 9,
-    FLV_CODECID_HEVC    = 12,
 };
 
 enum {
