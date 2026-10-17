@@ -47,7 +47,7 @@
  * to be large enough to fit the full request headers (including long
  * path names). */
 #define BUFFER_SIZE   MAX_URL_SIZE
-#define MAX_REDIRECTS 8
+#define MAX_REDIRECTS 15
 #define HTTP_SINGLE   1
 #define HTTP_MUTLI    2
 #define MAX_EXPIRY    19
