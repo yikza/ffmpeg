@@ -21,6 +21,8 @@
 #ifndef AVUTIL_APPLICATION_H
 #define AVUTIL_APPLICATION_H
 
+#include <stddef.h>
+#include <stdint.h>
 #include "libavutil/log.h"
 
 #define AVAPP_EVENT_WILL_HTTP_OPEN  1 //AVAppHttpEvent
@@ -112,7 +114,7 @@ void av_application_did_io_tcp_read(AVApplicationContext *h, void *obj, int byte
 int  av_application_on_io_control(AVApplicationContext *h, int event_type, AVAppIOControl *control);
 
 int av_application_on_tcp_will_open(AVApplicationContext *h);
-int av_application_on_tcp_did_open(AVApplicationContext *h, int error, int fd, AVAppTcpIOControl *control);
+int av_application_on_tcp_did_open(AVApplicationContext *h, int error, int fd);
 
 void av_application_on_async_statistic(AVApplicationContext *h, AVAppAsyncStatistic *statistic);
 void av_application_on_async_read_speed(AVApplicationContext *h, AVAppAsyncReadSpeed *speed);

@@ -21,7 +21,9 @@
  */
 
 #include "avcodec.h"
+#include "internal.h"
 #include "mpeg4video.h"
+#include "mpeg4videodec.h"
 #include "nvdec.h"
 #include "decode.h"
 
@@ -86,8 +88,9 @@ static int nvdec_mpeg4_start_frame(AVCodecContext *avctx, const uint8_t *buffer,
     };
 
     for (i = 0; i < 64; ++i) {
-        ppc->QuantMatrixIntra[i] = s->intra_matrix[i];
-        ppc->QuantMatrixInter[i] = s->inter_matrix[i];
+        int n = s->idsp.idct_permutation[i];
+        ppc->QuantMatrixIntra[i] = s->intra_matrix[n];
+        ppc->QuantMatrixInter[i] = s->inter_matrix[n];
     }
 
     // We need to pass the full frame buffer and not just the slice
@@ -103,7 +106,7 @@ static int nvdec_mpeg4_frame_params(AVCodecContext *avctx,
                                   AVBufferRef *hw_frames_ctx)
 {
     // Each frame can at most have one P and one B reference
-    return ff_nvdec_frame_params(avctx, hw_frames_ctx, 2);
+    return ff_nvdec_frame_params(avctx, hw_frames_ctx, 2, 0);
 }
 
 const AVHWAccel ff_mpeg4_nvdec_hwaccel = {

@@ -20,11 +20,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "common.h"
+#include <string.h>
+
+#include "config.h"
 #include "aes.h"
 #include "aes_internal.h"
+#include "error.h"
 #include "intreadwrite.h"
-#include "timer.h"
+#include "macros.h"
+#include "mem.h"
 
 const int av_aes_size= sizeof(AVAES);
 
@@ -265,4 +269,3 @@ int av_aes_init(AVAES *a, const uint8_t *key, int key_bits, int decrypt)
 
     return 0;
 }
-

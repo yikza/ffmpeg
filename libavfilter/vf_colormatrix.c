@@ -30,6 +30,7 @@
 
 #include <float.h>
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
 #include "internal.h"
 #include "video.h"
@@ -211,8 +212,8 @@ static int process_slice_uyvy422(AVFilterContext *ctx, void *arg, int jobnr, int
     const int width = src->width*2;
     const int src_pitch = src->linesize[0];
     const int dst_pitch = dst->linesize[0];
-    const int slice_start = (height *  jobnr   ) / nb_jobs;
-    const int slice_end   = (height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const unsigned char *srcp = src->data[0] + slice_start * src_pitch;
     unsigned char *dstp = dst->data[0] + slice_start * dst_pitch;
     const int c2 = td->c2;
@@ -247,8 +248,8 @@ static int process_slice_yuv444p(AVFilterContext *ctx, void *arg, int jobnr, int
     AVFrame *dst = td->dst;
     const int height = src->height;
     const int width = src->width;
-    const int slice_start = (height *  jobnr   ) / nb_jobs;
-    const int slice_end   = (height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const int src_pitchY  = src->linesize[0];
     const int src_pitchUV = src->linesize[1];
     const unsigned char *srcpU = src->data[1] + slice_start * src_pitchUV;
@@ -294,8 +295,8 @@ static int process_slice_yuv422p(AVFilterContext *ctx, void *arg, int jobnr, int
     AVFrame *dst = td->dst;
     const int height = src->height;
     const int width = src->width;
-    const int slice_start = (height *  jobnr   ) / nb_jobs;
-    const int slice_end   = (height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const int src_pitchY  = src->linesize[0];
     const int src_pitchUV = src->linesize[1];
     const unsigned char *srcpU = src->data[1] + slice_start * src_pitchUV;
@@ -342,8 +343,8 @@ static int process_slice_yuv420p(AVFilterContext *ctx, void *arg, int jobnr, int
     AVFrame *dst = td->dst;
     const int height = FFALIGN(src->height, 2) >> 1;
     const int width = src->width;
-    const int slice_start = ((height *  jobnr   ) / nb_jobs) << 1;
-    const int slice_end   = ((height * (jobnr+1)) / nb_jobs) << 1;
+    const int slice_start = (ff_slice_pos(height, jobnr, nb_jobs)) << 1;
+    const int slice_end   = (ff_slice_pos(height, jobnr + 1, nb_jobs)) << 1;
     const int src_pitchY  = src->linesize[0];
     const int src_pitchUV = src->linesize[1];
     const int dst_pitchY  = dst->linesize[0];
@@ -404,21 +405,6 @@ static int config_input(AVFilterLink *inlink)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,
-        AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_UYVY422,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
-
 static int filter_frame(AVFilterLink *link, AVFrame *in)
 {
     AVFilterContext *ctx = link->dst;
@@ -473,17 +459,17 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     td.c7 = color->yuv_convert[color->mode][2][2];
 
     if (in->format == AV_PIX_FMT_YUV444P)
-        ctx->internal->execute(ctx, process_slice_yuv444p, &td, NULL,
-                               FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
+        ff_filter_execute(ctx, process_slice_yuv444p, &td, NULL,
+                          FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
     else if (in->format == AV_PIX_FMT_YUV422P)
-        ctx->internal->execute(ctx, process_slice_yuv422p, &td, NULL,
-                               FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
+        ff_filter_execute(ctx, process_slice_yuv422p, &td, NULL,
+                          FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
     else if (in->format == AV_PIX_FMT_YUV420P)
-        ctx->internal->execute(ctx, process_slice_yuv420p, &td, NULL,
-                               FFMIN(in->height / 2, ff_filter_get_nb_threads(ctx)));
+        ff_filter_execute(ctx, process_slice_yuv420p, &td, NULL,
+                          FFMIN(in->height / 2, ff_filter_get_nb_threads(ctx)));
     else
-        ctx->internal->execute(ctx, process_slice_uyvy422, &td, NULL,
-                               FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
+        ff_filter_execute(ctx, process_slice_uyvy422, &td, NULL,
+                          FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
 
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
@@ -496,7 +482,6 @@ static const AVFilterPad colormatrix_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad colormatrix_outputs[] = {
@@ -504,17 +489,19 @@ static const AVFilterPad colormatrix_outputs[] = {
         .name = "default",
         .type = AVMEDIA_TYPE_VIDEO,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_colormatrix = {
+const AVFilter ff_vf_colormatrix = {
     .name          = "colormatrix",
     .description   = NULL_IF_CONFIG_SMALL("Convert color matrix."),
     .priv_size     = sizeof(ColorMatrixContext),
     .init          = init,
-    .query_formats = query_formats,
-    .inputs        = colormatrix_inputs,
-    .outputs       = colormatrix_outputs,
+    FILTER_INPUTS(colormatrix_inputs),
+    FILTER_OUTPUTS(colormatrix_outputs),
+    FILTER_PIXFMTS(AV_PIX_FMT_YUV444P,
+                   AV_PIX_FMT_YUV422P,
+                   AV_PIX_FMT_YUV420P,
+                   AV_PIX_FMT_UYVY422),
     .priv_class    = &colormatrix_class,
     .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
 };

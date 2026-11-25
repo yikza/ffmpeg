@@ -20,7 +20,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "avcodec.h"
+#include "internal.h"
 #include "nvdec.h"
 #include "decode.h"
 #include "vc1.h"
@@ -107,7 +110,7 @@ static int nvdec_vc1_frame_params(AVCodecContext *avctx,
                                   AVBufferRef *hw_frames_ctx)
 {
     // Each frame can at most have one P and one B reference
-    return ff_nvdec_frame_params(avctx, hw_frames_ctx, 2);
+    return ff_nvdec_frame_params(avctx, hw_frames_ctx, 2, 0);
 }
 
 const AVHWAccel ff_vc1_nvdec_hwaccel = {

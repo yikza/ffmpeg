@@ -9,6 +9,7 @@
 /bprint
 /camellia
 /cast5
+/channel_layout
 /color_utils
 /cpu
 /cpu_init
@@ -17,12 +18,15 @@
 /dict
 /display
 /error
+/encryption_info
 /eval
 /fifo
 /file
 /hash
 /hmac
+/hwdevice
 /imgutils
+/integer
 /lfg
 /lls
 /log
@@ -45,4 +49,5 @@
 /tree
 /twofish
 /utf8
+/uuid
 /xtea

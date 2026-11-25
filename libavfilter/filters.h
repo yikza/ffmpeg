@@ -61,10 +61,23 @@ int ff_inlink_process_commands(AVFilterLink *link, const AVFrame *frame);
 int ff_inlink_evaluate_timeline_at_frame(AVFilterLink *link, const AVFrame *frame);
 
 /**
+ * Get the number of frames available on the link.
+ * @return the number of frames available in the link fifo.
+ */
+size_t ff_inlink_queued_frames(AVFilterLink *link);
+
+/**
  * Test if a frame is available on the link.
  * @return  >0 if a frame is available
  */
 int ff_inlink_check_available_frame(AVFilterLink *link);
+
+
+/***
+  * Get the number of samples available on the link.
+  * @return the numer of samples available on the link.
+  */
+int ff_inlink_queued_samples(AVFilterLink *link);
 
 /**
  * Test if enough samples are available on the link.
@@ -101,6 +114,13 @@ int ff_inlink_consume_frame(AVFilterLink *link, AVFrame **rframe);
  */
 int ff_inlink_consume_samples(AVFilterLink *link, unsigned min, unsigned max,
                             AVFrame **rframe);
+
+/**
+ * Access a frame in the link fifo without consuming it.
+ * The first frame is numbered 0; the designated frame must exist.
+ * @return the frame at idx position in the link fifo.
+ */
+AVFrame *ff_inlink_peek_frame(AVFilterLink *link, size_t idx);
 
 /**
  * Make sure a frame is writable.
@@ -237,5 +257,28 @@ static inline void ff_outlink_set_status(AVFilterLink *link, int status, int64_t
         return 0; \
     } \
 } while (0)
+
+/**
+ * Check for flow control between input and output.
+ * This is necessary for filters that may produce several output frames for
+ * a single input event, otherwise they may produce them all at once,
+ * causing excessive memory consumption.
+ */
+int ff_inoutlink_check_flow(AVFilterLink *inlink, AVFilterLink *outlink);
+
+/**
+ * Compute the boundary index for a slice when work of size total is split
+ * into nb_jobs slices. Returns the first index of slice jobnr, so the slice
+ * jobnr covers [ff_slice_pos(total, jobnr, nb_jobs),
+ * ff_slice_pos(total, jobnr + 1, nb_jobs)).
+ *
+ * The multiplication is performed in 64bit to avoid signed overflow of the
+ * total * jobnr intermediate that would occur for large dimensions and many
+ * slice threads.
+ */
+static inline int ff_slice_pos(int total, int jobnr, int nb_jobs)
+{
+    return (int)((int64_t)total * jobnr / nb_jobs);
+}
 
 #endif /* AVFILTER_FILTERS_H */

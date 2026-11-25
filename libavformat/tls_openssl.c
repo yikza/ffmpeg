@@ -25,7 +25,6 @@
 #include "os_support.h"
 #include "url.h"
 #include "tls.h"
-#include "libavcodec/internal.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avutil.h"
 #include "libavutil/opt.h"
@@ -35,6 +34,7 @@
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>
 
 static int openssl_init;
 
@@ -46,9 +46,10 @@ typedef struct TLSContext {
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL
     BIO_METHOD* url_bio_method;
 #endif
+    int io_err;
 } TLSContext;
 
-#if HAVE_THREADS
+#if HAVE_THREADS && OPENSSL_VERSION_NUMBER < 0x10100000L
 #include <openssl/crypto.h>
 pthread_mutex_t *openssl_mutexes;
 static void openssl_lock(int mode, int type, const char *file, int line)
@@ -70,9 +71,16 @@ int ff_openssl_init(void)
 {
     ff_lock_avformat();
     if (!openssl_init) {
+        /* OpenSSL 1.0.2 or below, then you would use SSL_library_init. If you are
+         * using OpenSSL 1.1.0 or above, then the library will initialize
+         * itself automatically.
+         * https://wiki.openssl.org/index.php/Library_Initialization
+         */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         SSL_library_init();
         SSL_load_error_strings();
-#if HAVE_THREADS
+#endif
+#if HAVE_THREADS && OPENSSL_VERSION_NUMBER < 0x10100000L
         if (!CRYPTO_get_locking_callback()) {
             int i;
             openssl_mutexes = av_malloc_array(sizeof(pthread_mutex_t), CRYPTO_num_locks());
@@ -101,7 +109,7 @@ void ff_openssl_deinit(void)
     ff_lock_avformat();
     openssl_init--;
     if (!openssl_init) {
-#if HAVE_THREADS
+#if HAVE_THREADS && OPENSSL_VERSION_NUMBER < 0x10100000L
         if (CRYPTO_get_locking_callback() == openssl_lock) {
             int i;
             CRYPTO_set_locking_callback(NULL);
@@ -117,13 +125,25 @@ void ff_openssl_deinit(void)
 static int print_tls_error(URLContext *h, int ret)
 {
     TLSContext *c = h->priv_data;
+    int printed = 0, e, averr = AVERROR(EIO);
     if (h->flags & AVIO_FLAG_NONBLOCK) {
         int err = SSL_get_error(c->ssl, ret);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_READ)
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             return AVERROR(EAGAIN);
     }
-    av_log(h, AV_LOG_ERROR, "%s\n", ERR_error_string(ERR_get_error(), NULL));
-    return AVERROR(EIO);
+    while ((e = ERR_get_error()) != 0) {
+        av_log(h, AV_LOG_ERROR, "%s\n", ERR_error_string(e, NULL));
+        printed = 1;
+    }
+    if (c->io_err) {
+        av_log(h, AV_LOG_ERROR, "IO error: %s\n", av_err2str(c->io_err));
+        printed = 1;
+        averr = c->io_err;
+        c->io_err = 0;
+    }
+    if (!printed)
+        av_log(h, AV_LOG_ERROR, "Unknown error\n");
+    return averr;
 }
 
 static int tls_close(URLContext *h)
@@ -135,8 +155,7 @@ static int tls_close(URLContext *h)
     }
     if (c->ctx)
         SSL_CTX_free(c->ctx);
-    if (c->tls_shared.tcp)
-        ffurl_close(c->tls_shared.tcp);
+    ffurl_closep(&c->tls_shared.tcp);
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL
     if (c->url_bio_method)
         BIO_meth_free(c->url_bio_method);
@@ -172,29 +191,33 @@ static int url_bio_destroy(BIO *b)
 
 static int url_bio_bread(BIO *b, char *buf, int len)
 {
-    URLContext *h = GET_BIO_DATA(b);
-    int ret = ffurl_read(h, buf, len);
+    TLSContext *c = GET_BIO_DATA(b);
+    int ret = ffurl_read(c->tls_shared.tcp, buf, len);
     if (ret >= 0)
         return ret;
     BIO_clear_retry_flags(b);
-    if (ret == AVERROR(EAGAIN))
-        BIO_set_retry_read(b);
     if (ret == AVERROR_EXIT)
         return 0;
+    if (ret == AVERROR(EAGAIN))
+        BIO_set_retry_read(b);
+    else
+        c->io_err = ret;
     return -1;
 }
 
 static int url_bio_bwrite(BIO *b, const char *buf, int len)
 {
-    URLContext *h = GET_BIO_DATA(b);
-    int ret = ffurl_write(h, buf, len);
+    TLSContext *c = GET_BIO_DATA(b);
+    int ret = ffurl_write(c->tls_shared.tcp, buf, len);
     if (ret >= 0)
         return ret;
     BIO_clear_retry_flags(b);
-    if (ret == AVERROR(EAGAIN))
-        BIO_set_retry_write(b);
     if (ret == AVERROR_EXIT)
         return 0;
+    if (ret == AVERROR(EAGAIN))
+        BIO_set_retry_write(b);
+    else
+        c->io_err = ret;
     return -1;
 }
 
@@ -226,6 +249,73 @@ static BIO_METHOD url_bio_method = {
 };
 #endif
 
+static int tls_set_peer_name(URLContext *h)
+{
+    TLSContext *p = h->priv_data;
+    TLSShared *c = &p->tls_shared;
+    struct addrinfo hints = { 0 }, *ai = NULL;
+    int ret, numeric;
+
+    if (!c->host || !c->host[0]) {
+        av_log(h, AV_LOG_ERROR, "Missing TLS peer name\n");
+        return AVERROR(EINVAL);
+    }
+
+    /* verifyhost may differ from the TCP destination, including its type. */
+    hints.ai_flags = AI_NUMERICHOST;
+    ret = getaddrinfo(c->host, NULL, &hints, &ai);
+    if (ret && ret != EAI_NONAME) {
+        av_log(h, AV_LOG_ERROR, "Unable to parse TLS peer name: %s\n",
+               gai_strerror(ret));
+        return AVERROR(EIO);
+    }
+    numeric = !ret;
+
+    if (c->verify) {
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+        X509_VERIFY_PARAM *param = SSL_get0_param(p->ssl);
+
+        if (numeric) {
+            if (ai->ai_family == AF_INET) {
+                struct sockaddr_in *addr = (struct sockaddr_in *)ai->ai_addr;
+                ret = X509_VERIFY_PARAM_set1_ip(param,
+                          (const unsigned char *)&addr->sin_addr, 4);
+#if HAVE_STRUCT_SOCKADDR_IN6
+            } else if (ai->ai_family == AF_INET6) {
+                struct sockaddr_in6 *addr = (struct sockaddr_in6 *)ai->ai_addr;
+                ret = X509_VERIFY_PARAM_set1_ip(param,
+                          (const unsigned char *)&addr->sin6_addr, 16);
+#endif
+            } else {
+                ret = 0;
+            }
+        } else {
+            X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+            ret = X509_VERIFY_PARAM_set1_host(param, c->host, 0);
+        }
+        if (ai)
+            freeaddrinfo(ai);
+        if (!ret) {
+            av_log(h, AV_LOG_ERROR, "Unable to set TLS peer verification name\n");
+            return AVERROR(EIO);
+        }
+#else
+        if (ai)
+            freeaddrinfo(ai);
+        av_log(h, AV_LOG_ERROR, "TLS peer name verification requires OpenSSL 1.0.2 or newer\n");
+        return AVERROR(ENOSYS);
+#endif
+    } else if (ai) {
+        freeaddrinfo(ai);
+    }
+
+    if (!numeric && !SSL_set_tlsext_host_name(p->ssl, c->host)) {
+        av_log(h, AV_LOG_ERROR, "Unable to set TLS server name\n");
+        return AVERROR(EIO);
+    }
+    return 0;
+}
+
 static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
 {
     TLSContext *p = h->priv_data;
@@ -251,8 +341,17 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     }
     SSL_CTX_set_options(p->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
     if (c->ca_file) {
-        if (!SSL_CTX_load_verify_locations(p->ctx, c->ca_file, NULL))
+        if (!SSL_CTX_load_verify_locations(p->ctx, c->ca_file, NULL)) {
             av_log(h, AV_LOG_ERROR, "SSL_CTX_load_verify_locations %s\n", ERR_error_string(ERR_get_error(), NULL));
+            if (c->verify) {
+                ret = AVERROR(EIO);
+                goto fail;
+            }
+        }
+    } else if (c->verify && !SSL_CTX_set_default_verify_paths(p->ctx)) {
+        av_log(h, AV_LOG_ERROR, "Unable to load default CA certificates\n");
+        ret = AVERROR(EIO);
+        goto fail;
     }
     if (c->cert_file && !SSL_CTX_use_certificate_chain_file(p->ctx, c->cert_file)) {
         av_log(h, AV_LOG_ERROR, "Unable to load cert file %s: %s\n",
@@ -266,8 +365,6 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
         ret = AVERROR(EIO);
         goto fail;
     }
-    // Note, this doesn't check that the peer certificate actually matches
-    // the requested hostname.
     if (c->verify)
         SSL_CTX_set_verify(p->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
     p->ssl = SSL_new(p->ctx);
@@ -276,8 +373,14 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
         ret = AVERROR(EIO);
         goto fail;
     }
+    if (c->verify && !c->listen && (ret = tls_set_peer_name(h)) < 0)
+        goto fail;
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL
     p->url_bio_method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "urlprotocol bio");
+    if (!p->url_bio_method) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
     BIO_meth_set_write(p->url_bio_method, url_bio_bwrite);
     BIO_meth_set_read(p->url_bio_method, url_bio_bread);
     BIO_meth_set_puts(p->url_bio_method, url_bio_bputs);
@@ -285,13 +388,22 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     BIO_meth_set_create(p->url_bio_method, url_bio_create);
     BIO_meth_set_destroy(p->url_bio_method, url_bio_destroy);
     bio = BIO_new(p->url_bio_method);
-    BIO_set_data(bio, c->tcp);
+    if (!bio) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    BIO_set_data(bio, p);
 #else
     bio = BIO_new(&url_bio_method);
-    bio->ptr = c->tcp;
+    if (!bio) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    bio->ptr = p;
 #endif
     SSL_set_bio(p->ssl, bio, bio);
-    if (!c->listen && !c->numerichost)
+    /* Keep the legacy SNI behavior when verification is explicitly disabled. */
+    if (!c->verify && !c->listen && !c->numerichost)
         SSL_set_tlsext_host_name(p->ssl, c->host);
     ret = c->listen ? SSL_accept(p->ssl) : SSL_connect(p->ssl);
     if (ret == 0) {
@@ -345,6 +457,12 @@ static int tls_get_file_handle(URLContext *h)
     return ffurl_get_file_handle(c->tls_shared.tcp);
 }
 
+static int tls_get_short_seek(URLContext *h)
+{
+    TLSContext *s = h->priv_data;
+    return ffurl_get_short_seek(s->tls_shared.tcp);
+}
+
 static const AVOption options[] = {
     TLS_COMMON_OPTIONS(TLSContext, tls_shared),
     { NULL }
@@ -364,6 +482,7 @@ const URLProtocol ff_tls_protocol = {
     .url_write      = tls_write,
     .url_close      = tls_close,
     .url_get_file_handle = tls_get_file_handle,
+    .url_get_short_seek  = tls_get_short_seek,
     .priv_data_size = sizeof(TLSContext),
     .flags          = URL_PROTOCOL_FLAG_NETWORK,
     .priv_data_class = &tls_class,

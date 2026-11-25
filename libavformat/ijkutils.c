@@ -31,7 +31,7 @@ extern URLProtocol ff_##x##_protocol;                                           
 int ijkav_register_##x##_protocol(URLProtocol *protocol, int protocol_size);                        \
 int ijkav_register_##x##_protocol(URLProtocol *protocol, int protocol_size)                         \
 {                                                                                                   \
-    if (protocol_size != sizeof(URLProtocol)) {                                                     \
+    if (!protocol || protocol_size != sizeof(URLProtocol)) {                                                     \
         av_log(NULL, AV_LOG_ERROR, "ijkav_register_##x##_protocol: ABI mismatch.\n");               \
         return -1;                                                                                  \
     }                                                                                               \
@@ -59,7 +59,27 @@ static int ijkdummy_open(URLContext *h, const char *arg, int flags, AVDictionary
     return -1;
 }
 
-IJK_FF_PROTOCOL(async);
+int ijkav_register_async_protocol(URLProtocol *protocol, int protocol_size);
+int ijkav_register_async_protocol(URLProtocol *protocol, int protocol_size)
+{
+    if (!protocol || protocol_size != sizeof(URLProtocol)) {
+        av_log(NULL, AV_LOG_ERROR, "ijkav_register_async_protocol: ABI mismatch.\n");
+        return -1;
+    }
+
+    /*
+     * On FFmpeg 4.3 and 5.1 the built-in ff_async_protocol lives in read-only memory.
+     * Legacy ijk flow memcpy() overwrote it at runtime, which crashes with
+     * SEGV_ACCERR on Android 16KB-page binaries.
+     *
+     * Keep the registration call as a compatibility no-op and continue with the
+     * built-in async protocol implementation.
+     */
+    av_log(NULL, AV_LOG_WARNING,
+           "ijkav_register_async_protocol: skip overriding built-in async protocol on FFmpeg 5.1\n");
+    (void)protocol;
+    return 0;
+}
 IJK_DUMMY_PROTOCOL(ijkmediadatasource);
 IJK_DUMMY_PROTOCOL(ijkhttphook);
 IJK_DUMMY_PROTOCOL(ijklongurl);
@@ -72,7 +92,7 @@ extern AVInputFormat ff_##x##_demuxer;                                          
 int ijkav_register_##x##_demuxer(AVInputFormat *demuxer, int demuxer_size);                        \
 int ijkav_register_##x##_demuxer(AVInputFormat *demuxer, int demuxer_size)                         \
 {                                                                                                   \
-    if (demuxer_size != sizeof(AVInputFormat)) {                                                     \
+    if (!demuxer || demuxer_size != sizeof(AVInputFormat)) {                                                     \
         av_log(NULL, AV_LOG_ERROR, "ijkav_register_##x##_demuxer: ABI mismatch.\n");               \
         return -1;                                                                                  \
     }                                                                                               \

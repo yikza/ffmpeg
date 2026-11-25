@@ -16,6 +16,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/avstring.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
@@ -144,25 +146,16 @@ static int program_opencl_run(AVFilterContext *avctx)
             goto fail;
 
         av_log(avctx, AV_LOG_DEBUG, "Run kernel on plane %d "
-               "(%zux%zu).\n", plane, global_work[0], global_work[1]);
+               "(%"SIZE_SPECIFIER"x%"SIZE_SPECIFIER").\n",
+               plane, global_work[0], global_work[1]);
 
         cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel, 2, NULL,
                                      global_work, NULL, 0, NULL, NULL);
-        if (cle != CL_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to enqueue kernel: %d.\n",
-                   cle);
-            err = AVERROR(EIO);
-            goto fail;
-        }
+        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue kernel: %d.\n", cle);
     }
 
     cle = clFinish(ctx->command_queue);
-    if (cle != CL_SUCCESS) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to finish command queue: %d.\n",
-               cle);
-        err = AVERROR(EIO);
-        goto fail;
-    }
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue: %d.\n", cle);
 
     if (ctx->nb_inputs > 0) {
         err = av_frame_copy_props(output, ctx->frames[0]);
@@ -280,8 +273,7 @@ static av_cold int program_opencl_init(AVFilterContext *avctx)
     } else {
         int i;
 
-        ctx->frames = av_mallocz_array(ctx->nb_inputs,
-                                       sizeof(*ctx->frames));
+        ctx->frames = av_calloc(ctx->nb_inputs, sizeof(*ctx->frames));
         if (!ctx->frames)
             return AVERROR(ENOMEM);
 
@@ -296,11 +288,9 @@ static av_cold int program_opencl_init(AVFilterContext *avctx)
 
             input.config_props = &ff_opencl_filter_config_input;
 
-            err = ff_insert_inpad(avctx, i, &input);
-            if (err < 0) {
-                av_freep(&input.name);
+            err = ff_append_inpad_free_name(avctx, &input);
+            if (err < 0)
                 return err;
-            }
         }
     }
 
@@ -311,14 +301,11 @@ static av_cold void program_opencl_uninit(AVFilterContext *avctx)
 {
     ProgramOpenCLContext *ctx = avctx->priv;
     cl_int cle;
-    int i;
 
     if (ctx->nb_inputs > 0) {
         ff_framesync_uninit(&ctx->fs);
 
         av_freep(&ctx->frames);
-        for (i = 0; i < avctx->nb_inputs; i++)
-            av_freep(&avctx->input_pads[i].name);
     }
 
     if (ctx->kernel) {
@@ -368,21 +355,21 @@ static const AVFilterPad program_opencl_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = &program_opencl_config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_program_opencl = {
+const AVFilter ff_vf_program_opencl = {
     .name           = "program_opencl",
     .description    = NULL_IF_CONFIG_SMALL("Filter video using an OpenCL program"),
     .priv_size      = sizeof(ProgramOpenCLContext),
     .priv_class     = &program_opencl_class,
+    .flags          = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .preinit        = &program_opencl_framesync_preinit,
     .init           = &program_opencl_init,
     .uninit         = &program_opencl_uninit,
-    .query_formats  = &ff_opencl_filter_query_formats,
     .activate       = &program_opencl_activate,
     .inputs         = NULL,
-    .outputs        = program_opencl_outputs,
+    FILTER_OUTPUTS(program_opencl_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 
@@ -421,19 +408,18 @@ static const AVFilterPad openclsrc_outputs[] = {
         .config_props  = &program_opencl_config_output,
         .request_frame = &program_opencl_request_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_vsrc_openclsrc = {
+const AVFilter ff_vsrc_openclsrc = {
     .name           = "openclsrc",
     .description    = NULL_IF_CONFIG_SMALL("Generate video using an OpenCL program"),
     .priv_size      = sizeof(ProgramOpenCLContext),
     .priv_class     = &openclsrc_class,
     .init           = &program_opencl_init,
     .uninit         = &program_opencl_uninit,
-    .query_formats  = &ff_opencl_filter_query_formats,
     .inputs         = NULL,
-    .outputs        = openclsrc_outputs,
+    FILTER_OUTPUTS(openclsrc_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 

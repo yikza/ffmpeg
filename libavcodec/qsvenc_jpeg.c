@@ -28,8 +28,7 @@
 #include "libavutil/opt.h"
 
 #include "avcodec.h"
-#include "internal.h"
-#include "h264.h"
+#include "codec_internal.h"
 #include "qsv.h"
 #include "qsv_internal.h"
 #include "qsvenc.h"
@@ -64,6 +63,7 @@ static av_cold int qsv_enc_close(AVCodecContext *avctx)
 #define OFFSET(x) offsetof(QSVMJPEGEncContext, x)
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
+    { "async_depth", "Maximum processing parallelism", OFFSET(qsv.async_depth), AV_OPT_TYPE_INT, { .i64 = ASYNC_DEPTH_DEFAULT }, 1, INT_MAX, VE },
     { NULL },
 };
 
@@ -74,19 +74,26 @@ static const AVClass class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVCodec ff_mjpeg_qsv_encoder = {
-    .name           = "mjpeg_qsv",
-    .long_name      = NULL_IF_CONFIG_SMALL("MJPEG (Intel Quick Sync Video acceleration)"),
+static const FFCodecDefault qsv_enc_defaults[] = {
+    { "global_quality",  "80" },
+    { NULL },
+};
+
+const FFCodec ff_mjpeg_qsv_encoder = {
+    .p.name         = "mjpeg_qsv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("MJPEG (Intel Quick Sync Video acceleration)"),
     .priv_data_size = sizeof(QSVMJPEGEncContext),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_MJPEG,
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MJPEG,
     .init           = qsv_enc_init,
-    .encode2        = qsv_enc_frame,
+    FF_CODEC_ENCODE_CB(qsv_enc_frame),
     .close          = qsv_enc_close,
-    .capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HYBRID,
-    .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_NV12,
+    .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HYBRID,
+    .p.pix_fmts     = (const enum AVPixelFormat[]){ AV_PIX_FMT_NV12,
                                                     AV_PIX_FMT_QSV,
                                                     AV_PIX_FMT_NONE },
-    .priv_class     = &class,
-    .wrapper_name   = "qsv",
+    .p.priv_class   = &class,
+    .defaults       = qsv_enc_defaults,
+    .p.wrapper_name = "qsv",
+    .hw_configs     = ff_qsv_enc_hw_configs,
 };

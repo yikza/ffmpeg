@@ -21,16 +21,15 @@
 
 #include "motion_estimation.h"
 #include "libavcodec/mathops.h"
-#include "libavutil/avassert.h"
 #include "libavutil/common.h"
 #include "libavutil/motion_vector.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "libavutil/pixelutils.h"
 #include "avfilter.h"
 #include "formats.h"
 #include "internal.h"
 #include "video.h"
+#include "scene_sad.h"
 
 #define ME_MODE_BIDIR 0
 #define ME_MODE_BILAT 1
@@ -185,10 +184,11 @@ typedef struct MIContext {
     int64_t out_pts;
     int b_width, b_height, b_count;
     int log2_mb_size;
+    int bitdepth;
 
     int scd_method;
     int scene_changed;
-    av_pixelutils_sad_fn sad;
+    ff_scene_sad_fn sad;
     double prev_mafd;
     double scd_threshold;
 
@@ -229,31 +229,23 @@ static const AVOption minterpolate_options[] = {
     { "scd", "scene change detection method", OFFSET(scd_method), AV_OPT_TYPE_INT, {.i64 = SCD_METHOD_FDIFF}, SCD_METHOD_NONE, SCD_METHOD_FDIFF, FLAGS, "scene" },
         CONST("none",   "disable detection",                    SCD_METHOD_NONE,        "scene"),
         CONST("fdiff",  "frame difference",                     SCD_METHOD_FDIFF,       "scene"),
-    { "scd_threshold", "scene change threshold", OFFSET(scd_threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 5.0}, 0, 100.0, FLAGS },
+    { "scd_threshold", "scene change threshold", OFFSET(scd_threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 10.}, 0, 100.0, FLAGS },
     { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(minterpolate);
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
-        AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ420P,
-        AV_PIX_FMT_YUVJ411P,
-        AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA444P,
-        AV_PIX_FMT_GRAY8,
-        AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ420P,
+    AV_PIX_FMT_YUVJ411P,
+    AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA444P,
+    AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_NONE
+};
 
 static uint64_t get_sbad(AVMotionEstContext *me_ctx, int x, int y, int x_mv, int y_mv)
 {
@@ -339,10 +331,11 @@ static int config_input(AVFilterLink *inlink)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     const int height = inlink->h;
     const int width  = inlink->w;
-    int i, ret = 0;
+    int i;
 
     mi_ctx->log2_chroma_h = desc->log2_chroma_h;
     mi_ctx->log2_chroma_w = desc->log2_chroma_w;
+    mi_ctx->bitdepth = desc->comp[0].depth;
 
     mi_ctx->nb_planes = av_pix_fmt_count_planes(inlink->format);
 
@@ -355,27 +348,39 @@ static int config_input(AVFilterLink *inlink)
 
     for (i = 0; i < NB_FRAMES; i++) {
         Frame *frame = &mi_ctx->frames[i];
-        frame->blocks = av_mallocz_array(mi_ctx->b_count, sizeof(Block));
+        frame->blocks = av_calloc(mi_ctx->b_count, sizeof(*frame->blocks));
         if (!frame->blocks)
             return AVERROR(ENOMEM);
     }
 
     if (mi_ctx->mi_mode == MI_MODE_MCI) {
-        mi_ctx->pixel_mvs = av_mallocz_array(width * height, sizeof(PixelMVS));
-        mi_ctx->pixel_weights = av_mallocz_array(width * height, sizeof(PixelWeights));
-        mi_ctx->pixel_refs = av_mallocz_array(width * height, sizeof(PixelRefs));
-        if (!mi_ctx->pixel_mvs || !mi_ctx->pixel_weights || !mi_ctx->pixel_refs) {
-            ret = AVERROR(ENOMEM);
-            goto fail;
+        if (mi_ctx->b_width < 2 || mi_ctx->b_height < 2) {
+            av_log(inlink->dst, AV_LOG_ERROR, "Height or width < %d\n",
+                   2 * mi_ctx->mb_size);
+            return AVERROR(EINVAL);
         }
+        ff_me_init_context(me_ctx, mi_ctx->mb_size, mi_ctx->search_param,
+                           width, height, 0, (mi_ctx->b_width - 1) << mi_ctx->log2_mb_size,
+                           0, (mi_ctx->b_height - 1) << mi_ctx->log2_mb_size);
+
+        if (mi_ctx->me_mode == ME_MODE_BIDIR)
+            me_ctx->get_cost = &get_sad_ob;
+        else if (mi_ctx->me_mode == ME_MODE_BILAT)
+            me_ctx->get_cost = &get_sbad_ob;
+
+        mi_ctx->pixel_mvs     = av_calloc(width * height, sizeof(*mi_ctx->pixel_mvs));
+        mi_ctx->pixel_weights = av_calloc(width * height, sizeof(*mi_ctx->pixel_weights));
+        mi_ctx->pixel_refs    = av_calloc(width * height, sizeof(*mi_ctx->pixel_refs));
+        if (!mi_ctx->pixel_mvs || !mi_ctx->pixel_weights || !mi_ctx->pixel_refs)
+            return AVERROR(ENOMEM);
 
         if (mi_ctx->me_mode == ME_MODE_BILAT)
-            if (!(mi_ctx->int_blocks = av_mallocz_array(mi_ctx->b_count, sizeof(Block))))
+            if (!FF_ALLOCZ_TYPED_ARRAY(mi_ctx->int_blocks, mi_ctx->b_count))
                 return AVERROR(ENOMEM);
 
         if (mi_ctx->me_method == AV_ME_METHOD_EPZS) {
             for (i = 0; i < 3; i++) {
-                mi_ctx->mv_table[i] = av_mallocz_array(mi_ctx->b_count, sizeof(*mi_ctx->mv_table[0]));
+                mi_ctx->mv_table[i] = av_calloc(mi_ctx->b_count, sizeof(*mi_ctx->mv_table[0]));
                 if (!mi_ctx->mv_table[i])
                     return AVERROR(ENOMEM);
             }
@@ -383,26 +388,12 @@ static int config_input(AVFilterLink *inlink)
     }
 
     if (mi_ctx->scd_method == SCD_METHOD_FDIFF) {
-        mi_ctx->sad = av_pixelutils_get_sad_fn(3, 3, 2, mi_ctx);
+        mi_ctx->sad = ff_scene_sad_get_fn(mi_ctx->bitdepth == 8 ? 8 : 16);
         if (!mi_ctx->sad)
             return AVERROR(EINVAL);
     }
 
-    ff_me_init_context(me_ctx, mi_ctx->mb_size, mi_ctx->search_param, width, height, 0, (mi_ctx->b_width - 1) << mi_ctx->log2_mb_size, 0, (mi_ctx->b_height - 1) << mi_ctx->log2_mb_size);
-
-    if (mi_ctx->me_mode == ME_MODE_BIDIR)
-        me_ctx->get_cost = &get_sad_ob;
-    else if (mi_ctx->me_mode == ME_MODE_BILAT)
-        me_ctx->get_cost = &get_sbad_ob;
-
     return 0;
-fail:
-    for (i = 0; i < NB_FRAMES; i++)
-        av_freep(&mi_ctx->frames[i].blocks);
-    av_freep(&mi_ctx->pixel_mvs);
-    av_freep(&mi_ctx->pixel_weights);
-    av_freep(&mi_ctx->pixel_refs);
-    return ret;
 }
 
 static int config_output(AVFilterLink *outlink)
@@ -605,7 +596,7 @@ static int var_size_bme(MIContext *mi_ctx, Block *block, int x_mb, int y_mb, int
     }
 
     if (!block->subs) {
-        block->subs = av_mallocz_array(4, sizeof(Block));
+        block->subs = av_mallocz(4 * sizeof(*block->subs));
         if (!block->subs)
             return AVERROR(ENOMEM);
     }
@@ -823,24 +814,21 @@ static int inject_frame(AVFilterLink *inlink, AVFrame *avf_in)
     return 0;
 }
 
-static int detect_scene_change(MIContext *mi_ctx)
+static int detect_scene_change(AVFilterContext *ctx)
 {
-    AVMotionEstContext *me_ctx = &mi_ctx->me_ctx;
-    int x, y;
-    int linesize = me_ctx->linesize;
+    MIContext *mi_ctx = ctx->priv;
+    AVFilterLink *input = ctx->inputs[0];
     uint8_t *p1 = mi_ctx->frames[1].avf->data[0];
+    ptrdiff_t linesize1 = mi_ctx->frames[1].avf->linesize[0];
     uint8_t *p2 = mi_ctx->frames[2].avf->data[0];
+    ptrdiff_t linesize2 = mi_ctx->frames[2].avf->linesize[0];
 
     if (mi_ctx->scd_method == SCD_METHOD_FDIFF) {
         double ret = 0, mafd, diff;
-        int64_t sad;
-
-        for (sad = y = 0; y < me_ctx->height; y += 8)
-            for (x = 0; x < linesize; x += 8)
-                sad += mi_ctx->sad(p1 + x + y * linesize, linesize, p2 + x + y * linesize, linesize);
-
+        uint64_t sad;
+        mi_ctx->sad(p1, linesize1, p2, linesize2, input->w, input->h, &sad);
         emms_c();
-        mafd = (double) sad / (me_ctx->height * me_ctx->width * 3);
+        mafd = (double) sad * 100.0 / (input->h * input->w) / (1 << mi_ctx->bitdepth);
         diff = fabs(mafd - mi_ctx->prev_mafd);
         ret  = av_clipf(FFMIN(mafd, diff), 0, 100.0);
         mi_ctx->prev_mafd = mafd;
@@ -1090,8 +1078,13 @@ static void interpolate(AVFilterLink *inlink, AVFrame *avf_out)
     pts = av_rescale(avf_out->pts, (int64_t) ALPHA_MAX * outlink->time_base.num * inlink->time_base.den,
                                    (int64_t)             outlink->time_base.den * inlink->time_base.num);
 
-    alpha = (pts - mi_ctx->frames[1].avf->pts * ALPHA_MAX) / (mi_ctx->frames[2].avf->pts - mi_ctx->frames[1].avf->pts);
-    alpha = av_clip(alpha, 0, ALPHA_MAX);
+    if (mi_ctx->frames[2].avf->pts > mi_ctx->frames[1].avf->pts) {
+        alpha = (pts - mi_ctx->frames[1].avf->pts * ALPHA_MAX) / (mi_ctx->frames[2].avf->pts - mi_ctx->frames[1].avf->pts);
+        alpha = av_clip(alpha, 0, ALPHA_MAX);
+    } else {
+        av_log(ctx, AV_LOG_DEBUG, "duplicate input PTS detected\n");
+        alpha = 0;
+    }
 
     if (alpha == 0 || alpha == ALPHA_MAX) {
         av_frame_copy(avf_out, alpha ? mi_ctx->frames[2].avf : mi_ctx->frames[1].avf);
@@ -1099,6 +1092,7 @@ static void interpolate(AVFilterLink *inlink, AVFrame *avf_out)
     }
 
     if (mi_ctx->scene_changed) {
+        av_log(ctx, AV_LOG_DEBUG, "scene changed, input pts %"PRId64"\n", mi_ctx->frames[1].avf->pts);
         /* duplicate frame */
         av_frame_copy(avf_out, alpha > ALPHA_MAX / 2 ? mi_ctx->frames[2].avf : mi_ctx->frames[1].avf);
         return;
@@ -1122,8 +1116,8 @@ static void interpolate(AVFilterLink *inlink, AVFrame *avf_out)
                 for (y = 0; y < height; y++) {
                     for (x = 0; x < width; x++) {
                         avf_out->data[plane][x + y * avf_out->linesize[plane]] =
-                                          alpha  * mi_ctx->frames[2].avf->data[plane][x + y * mi_ctx->frames[2].avf->linesize[plane]] +
-                            ((ALPHA_MAX - alpha) * mi_ctx->frames[1].avf->data[plane][x + y * mi_ctx->frames[1].avf->linesize[plane]] + 512) >> 10;
+                            (alpha  * mi_ctx->frames[2].avf->data[plane][x + y * mi_ctx->frames[2].avf->linesize[plane]] +
+                             (ALPHA_MAX - alpha) * mi_ctx->frames[1].avf->data[plane][x + y * mi_ctx->frames[1].avf->linesize[plane]] + 512) >> 10;
                     }
                 }
             }
@@ -1187,7 +1181,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *avf_in)
     if (!mi_ctx->frames[0].avf)
         return 0;
 
-    mi_ctx->scene_changed = detect_scene_change(mi_ctx);
+    mi_ctx->scene_changed = detect_scene_change(ctx);
 
     for (;;) {
         AVFrame *avf_out;
@@ -1248,7 +1242,6 @@ static const AVFilterPad minterpolate_inputs[] = {
         .filter_frame  = filter_frame,
         .config_props  = config_input,
     },
-    { NULL }
 };
 
 static const AVFilterPad minterpolate_outputs[] = {
@@ -1257,16 +1250,15 @@ static const AVFilterPad minterpolate_outputs[] = {
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_minterpolate = {
+const AVFilter ff_vf_minterpolate = {
     .name          = "minterpolate",
     .description   = NULL_IF_CONFIG_SMALL("Frame rate conversion using Motion Interpolation."),
     .priv_size     = sizeof(MIContext),
     .priv_class    = &minterpolate_class,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = minterpolate_inputs,
-    .outputs       = minterpolate_outputs,
+    FILTER_INPUTS(minterpolate_inputs),
+    FILTER_OUTPUTS(minterpolate_outputs),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

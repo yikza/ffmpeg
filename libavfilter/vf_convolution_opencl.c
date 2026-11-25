@@ -18,6 +18,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
+#include "libavutil/avassert.h"
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
@@ -47,12 +50,16 @@ typedef struct ConvolutionOpenCLContext {
     cl_float rdivs[4];
     cl_float biases[4];
 
-} ConvolutionOpenCLContext;
+    cl_int planes;
+    cl_float scale;
+    cl_float delta;
 
+} ConvolutionOpenCLContext;
 
 static int convolution_opencl_init(AVFilterContext *avctx)
 {
     ConvolutionOpenCLContext *ctx = avctx->priv;
+    const char *kernel_name;
     cl_int cle;
     int err;
 
@@ -63,19 +70,23 @@ static int convolution_opencl_init(AVFilterContext *avctx)
     ctx->command_queue = clCreateCommandQueue(ctx->ocf.hwctx->context,
                                               ctx->ocf.hwctx->device_id,
                                               0, &cle);
-    if (!ctx->command_queue) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create OpenCL "
-               "command queue: %d.\n", cle);
-        err = AVERROR(EIO);
-        goto fail;
-    }
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL "
+                     "command queue %d.\n", cle);
 
-    ctx->kernel = clCreateKernel(ctx->ocf.program, "convolution_global", &cle);
-    if (!ctx->kernel) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create kernel: %d.\n", cle);
-        err = AVERROR(EIO);
-        goto fail;
+    if (!strcmp(avctx->filter->name, "convolution_opencl")) {
+        kernel_name = "convolution_global";
+    } else if (!strcmp(avctx->filter->name, "sobel_opencl")) {
+        kernel_name = "sobel_global";
+    } else if (!strcmp(avctx->filter->name, "prewitt_opencl")){
+        kernel_name = "prewitt_global";
+    } else if (!strcmp(avctx->filter->name, "roberts_opencl")){
+        kernel_name = "roberts_global";
+    } else {
+        av_assert0(0);
     }
+    ctx->kernel = clCreateKernel(ctx->ocf.program, kernel_name, &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create "
+                     "kernel %d.\n", cle);
 
     ctx->initialised = 1;
     return 0;
@@ -173,6 +184,8 @@ static int convolution_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
     size_t global_work[2];
     cl_mem src, dst;
     int err, p;
+    size_t origin[3] = {0, 0, 0};
+    size_t region[3] = {0, 0, 1};
 
     av_log(ctx, AV_LOG_DEBUG, "Filter input: %s, %ux%u (%"PRId64").\n",
            av_get_pix_fmt_name(input->format),
@@ -186,9 +199,14 @@ static int convolution_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
         if (err < 0)
             goto fail;
 
-        err = convolution_opencl_make_filter_params(avctx);
-        if (err < 0)
-            goto fail;
+        if (!strcmp(avctx->filter->name, "convolution_opencl")) {
+            err = convolution_opencl_make_filter_params(avctx);
+            if (err < 0)
+                goto fail;
+        } else {
+            ctx->delta /= 255.0;
+        }
+
     }
 
     output = ff_get_video_buffer(outlink, outlink->w, outlink->h);
@@ -204,70 +222,62 @@ static int convolution_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
         if (!dst)
             break;
 
-        cle = clSetKernelArg(ctx->kernel, 0, sizeof(cl_mem), &dst);
-        if (cle != CL_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set kernel "
-                   "destination image argument: %d.\n", cle);
-            goto fail;
-        }
-        cle = clSetKernelArg(ctx->kernel, 1, sizeof(cl_mem), &src);
-        if (cle != CL_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set kernel "
-                   "source image argument: %d.\n", cle);
-            goto fail;
-        }
-        cle = clSetKernelArg(ctx->kernel, 2, sizeof(cl_int), &ctx->dims[p]);
-        if (cle != CL_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set kernel "
-                   "matrix size argument: %d.\n", cle);
-            goto fail;
-        }
-        cle = clSetKernelArg(ctx->kernel, 3, sizeof(cl_mem), &ctx->matrix[p]);
-        if (cle != CL_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set kernel "
-                   "matrix argument: %d.\n", cle);
-            goto fail;
-        }
-        cle = clSetKernelArg(ctx->kernel, 4, sizeof(cl_float), &ctx->rdivs[p]);
-        if (cle != CL_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set kernel "
-                   "rdiv argument: %d.\n", cle);
-            goto fail;
-        }
-        cle = clSetKernelArg(ctx->kernel, 5, sizeof(cl_float), &ctx->biases[p]);
-        if (cle != CL_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set kernel "
-                   "bias argument: %d.\n", cle);
-            goto fail;
-        }
+        if (!strcmp(avctx->filter->name, "convolution_opencl")) {
+            CL_SET_KERNEL_ARG(ctx->kernel, 0, cl_mem,   &dst);
+            CL_SET_KERNEL_ARG(ctx->kernel, 1, cl_mem,   &src);
+            CL_SET_KERNEL_ARG(ctx->kernel, 2, cl_int,   &ctx->dims[p]);
+            CL_SET_KERNEL_ARG(ctx->kernel, 3, cl_mem,   &ctx->matrix[p]);
+            CL_SET_KERNEL_ARG(ctx->kernel, 4, cl_float, &ctx->rdivs[p]);
+            CL_SET_KERNEL_ARG(ctx->kernel, 5, cl_float, &ctx->biases[p]);
 
+            err = ff_opencl_filter_work_size_from_image(avctx, global_work, output, p, 0);
+            if (err < 0)
+                goto fail;
 
-        err = ff_opencl_filter_work_size_from_image(avctx, global_work, output, p, 0);
-        if (err < 0)
-            goto fail;
+            av_log(avctx, AV_LOG_DEBUG, "Run kernel on plane %d "
+                   "(%"SIZE_SPECIFIER"x%"SIZE_SPECIFIER").\n",
+                   p, global_work[0], global_work[1]);
 
-        av_log(avctx, AV_LOG_DEBUG, "Run kernel on plane %d "
-               "(%"SIZE_SPECIFIER"x%"SIZE_SPECIFIER").\n",
-               p, global_work[0], global_work[1]);
+            cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel, 2, NULL,
+                                         global_work, NULL,
+                                         0, NULL, NULL);
+            CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue "
+                             "kernel: %d.\n", cle);
+        } else {
+            if (!(ctx->planes & (1 << p))) {
+                err = ff_opencl_filter_work_size_from_image(avctx, region, output, p, 0);
+                if (err < 0)
+                    goto fail;
 
-        cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel, 2, NULL,
-                                     global_work, NULL,
-                                     0, NULL, NULL);
-        if (cle != CL_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to enqueue kernel: %d.\n",
-                   cle);
-            err = AVERROR(EIO);
-            goto fail;
+                cle = clEnqueueCopyImage(ctx->command_queue, src, dst,
+                                         origin, origin, region, 0, NULL, NULL);
+                CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to copy plane %d: %d.\n",
+                                 p, cle);
+            } else {
+                CL_SET_KERNEL_ARG(ctx->kernel, 0, cl_mem,   &dst);
+                CL_SET_KERNEL_ARG(ctx->kernel, 1, cl_mem,   &src);
+                CL_SET_KERNEL_ARG(ctx->kernel, 2, cl_float, &ctx->scale);
+                CL_SET_KERNEL_ARG(ctx->kernel, 3, cl_float, &ctx->delta);
+
+                err = ff_opencl_filter_work_size_from_image(avctx, global_work, output, p, 0);
+                if (err < 0)
+                    goto fail;
+
+                av_log(avctx, AV_LOG_DEBUG, "Run kernel on plane %d "
+                       "(%"SIZE_SPECIFIER"x%"SIZE_SPECIFIER").\n",
+                       p, global_work[0], global_work[1]);
+
+                cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel, 2, NULL,
+                                                         global_work, NULL,
+                                                         0, NULL, NULL);
+                CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue "
+                                 "kernel: %d.\n", cle);
+            }
         }
     }
 
     cle = clFinish(ctx->command_queue);
-    if (cle != CL_SUCCESS) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to finish command queue: %d.\n",
-               cle);
-        err = AVERROR(EIO);
-        goto fail;
-    }
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue: %d.\n", cle);
 
     err = av_frame_copy_props(output, input);
     if (err < 0)
@@ -315,8 +325,28 @@ static av_cold void convolution_opencl_uninit(AVFilterContext *avctx)
     ff_opencl_filter_uninit(avctx);
 }
 
+static const AVFilterPad convolution_opencl_inputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .filter_frame = &convolution_opencl_filter_frame,
+        .config_props = &ff_opencl_filter_config_input,
+    },
+};
+
+static const AVFilterPad convolution_opencl_outputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .config_props = &ff_opencl_filter_config_output,
+    },
+};
+
 #define OFFSET(x) offsetof(ConvolutionOpenCLContext, x)
 #define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
+
+#if CONFIG_CONVOLUTION_OPENCL_FILTER
+
 static const AVOption convolution_opencl_options[] = {
     { "0m", "set matrix for 2nd plane", OFFSET(matrix_str[0]), AV_OPT_TYPE_STRING, {.str="0 0 0 0 1 0 0 0 0"}, 0, 0, FLAGS },
     { "1m", "set matrix for 2nd plane", OFFSET(matrix_str[1]), AV_OPT_TYPE_STRING, {.str="0 0 0 0 1 0 0 0 0"}, 0, 0, FLAGS },
@@ -335,34 +365,95 @@ static const AVOption convolution_opencl_options[] = {
 
 AVFILTER_DEFINE_CLASS(convolution_opencl);
 
-static const AVFilterPad convolution_opencl_inputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = &convolution_opencl_filter_frame,
-        .config_props = &ff_opencl_filter_config_input,
-    },
-    { NULL }
-};
-
-static const AVFilterPad convolution_opencl_outputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-        .config_props = &ff_opencl_filter_config_output,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_convolution_opencl = {
+const AVFilter ff_vf_convolution_opencl = {
     .name           = "convolution_opencl",
     .description    = NULL_IF_CONFIG_SMALL("Apply convolution mask to input video"),
     .priv_size      = sizeof(ConvolutionOpenCLContext),
     .priv_class     = &convolution_opencl_class,
     .init           = &ff_opencl_filter_init,
     .uninit         = &convolution_opencl_uninit,
-    .query_formats  = &ff_opencl_filter_query_formats,
-    .inputs         = convolution_opencl_inputs,
-    .outputs        = convolution_opencl_outputs,
+    FILTER_INPUTS(convolution_opencl_inputs),
+    FILTER_OUTPUTS(convolution_opencl_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
+
+#endif /* CONFIG_CONVOLUTION_OPENCL_FILTER */
+
+#if CONFIG_SOBEL_OPENCL_FILTER
+
+static const AVOption sobel_opencl_options[] = {
+    { "planes", "set planes to filter", OFFSET(planes), AV_OPT_TYPE_INT,  {.i64=15}, 0, 15, FLAGS},
+    { "scale",  "set scale",            OFFSET(scale), AV_OPT_TYPE_FLOAT, {.dbl=1.0}, 0.0,  65535, FLAGS},
+    { "delta",  "set delta",            OFFSET(delta), AV_OPT_TYPE_FLOAT, {.dbl=0}, -65535, 65535, FLAGS},
+    { NULL }
+};
+
+AVFILTER_DEFINE_CLASS(sobel_opencl);
+
+const AVFilter ff_vf_sobel_opencl = {
+    .name           = "sobel_opencl",
+    .description    = NULL_IF_CONFIG_SMALL("Apply sobel operator"),
+    .priv_size      = sizeof(ConvolutionOpenCLContext),
+    .priv_class     = &sobel_opencl_class,
+    .init           = &ff_opencl_filter_init,
+    .uninit         = &convolution_opencl_uninit,
+    FILTER_INPUTS(convolution_opencl_inputs),
+    FILTER_OUTPUTS(convolution_opencl_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
+};
+
+#endif /* CONFIG_SOBEL_OPENCL_FILTER */
+
+#if CONFIG_PREWITT_OPENCL_FILTER
+
+static const AVOption prewitt_opencl_options[] = {
+    { "planes", "set planes to filter", OFFSET(planes), AV_OPT_TYPE_INT,  {.i64=15}, 0, 15, FLAGS},
+    { "scale",  "set scale",            OFFSET(scale), AV_OPT_TYPE_FLOAT, {.dbl=1.0}, 0.0,  65535, FLAGS},
+    { "delta",  "set delta",            OFFSET(delta), AV_OPT_TYPE_FLOAT, {.dbl=0}, -65535, 65535, FLAGS},
+    { NULL }
+};
+
+AVFILTER_DEFINE_CLASS(prewitt_opencl);
+
+const AVFilter ff_vf_prewitt_opencl = {
+    .name           = "prewitt_opencl",
+    .description    = NULL_IF_CONFIG_SMALL("Apply prewitt operator"),
+    .priv_size      = sizeof(ConvolutionOpenCLContext),
+    .priv_class     = &prewitt_opencl_class,
+    .init           = &ff_opencl_filter_init,
+    .uninit         = &convolution_opencl_uninit,
+    FILTER_INPUTS(convolution_opencl_inputs),
+    FILTER_OUTPUTS(convolution_opencl_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
+};
+
+#endif /* CONFIG_PREWITT_OPENCL_FILTER */
+
+#if CONFIG_ROBERTS_OPENCL_FILTER
+
+static const AVOption roberts_opencl_options[] = {
+    { "planes", "set planes to filter", OFFSET(planes), AV_OPT_TYPE_INT,  {.i64=15}, 0, 15, FLAGS},
+    { "scale",  "set scale",            OFFSET(scale), AV_OPT_TYPE_FLOAT, {.dbl=1.0}, 0.0,  65535, FLAGS},
+    { "delta",  "set delta",            OFFSET(delta), AV_OPT_TYPE_FLOAT, {.dbl=0}, -65535, 65535, FLAGS},
+    { NULL }
+};
+
+AVFILTER_DEFINE_CLASS(roberts_opencl);
+
+const AVFilter ff_vf_roberts_opencl = {
+    .name           = "roberts_opencl",
+    .description    = NULL_IF_CONFIG_SMALL("Apply roberts operator"),
+    .priv_size      = sizeof(ConvolutionOpenCLContext),
+    .priv_class     = &roberts_opencl_class,
+    .init           = &ff_opencl_filter_init,
+    .uninit         = &convolution_opencl_uninit,
+    FILTER_INPUTS(convolution_opencl_inputs),
+    FILTER_OUTPUTS(convolution_opencl_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
+};
+
+#endif /* CONFIG_ROBERTS_OPENCL_FILTER */

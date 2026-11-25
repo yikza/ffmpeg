@@ -36,6 +36,7 @@
 
 
 function fft4_neon
+        AARCH64_VALID_JUMP_TARGET
         ld1             {v0.2s,v1.2s,v2.2s,v3.2s}, [x0]
 
         fadd            v4.2s,  v0.2s,  v1.2s   // r0+r1,i0+i1
@@ -58,6 +59,7 @@ function fft4_neon
 endfunc
 
 function fft8_neon
+        AARCH64_VALID_JUMP_TARGET
         mov             x1,  x0
         ld1             {v0.2s, v1.2s, v2.2s, v3.2s},  [x0], #32
         ld1             {v16.2s,v17.2s,v18.2s,v19.2s}, [x0]
@@ -108,6 +110,7 @@ function fft8_neon
 endfunc
 
 function fft16_neon
+        AARCH64_VALID_JUMP_TARGET
         mov             x1,  x0
         ld1             {v0.2s, v1.2s, v2.2s, v3.2s},  [x0], #32
         ld1             {v16.2s,v17.2s,v18.2s,v19.2s}, [x0], #32
@@ -337,6 +340,8 @@ endfunc
 
 .macro  def_fft n, n2, n4
 function fft\n\()_neon, align=6
+        AARCH64_VALID_JUMP_TARGET
+        AARCH64_SIGN_LINK_REGISTER
         sub             sp,  sp,  #16
         stp             x28, x30, [sp]
         add             x28, x0,  #\n4*2*8
@@ -347,24 +352,25 @@ function fft\n\()_neon, align=6
         bl              fft\n4\()_neon
         sub             x0,  x28, #\n4*2*8
         ldp             x28, x30, [sp], #16
+        AARCH64_VALIDATE_LINK_REGISTER
         movrel          x4,  X(ff_cos_\n)
         mov             x2,  #\n4>>1
         b               fft_pass_neon
 endfunc
 .endm
 
-        def_fft    32,    16,     8
-        def_fft    64,    32,    16
-        def_fft   128,    64,    32
-        def_fft   256,   128,    64
-        def_fft   512,   256,   128
-        def_fft  1024,   512,   256
-        def_fft  2048,  1024,   512
-        def_fft  4096,  2048,  1024
-        def_fft  8192,  4096,  2048
-        def_fft 16384,  8192,  4096
-        def_fft 32768, 16384,  8192
-        def_fft 65536, 32768, 16384
+        def_fft         32,    16,     8
+        def_fft         64,    32,    16
+        def_fft         128,    64,    32
+        def_fft         256,   128,    64
+        def_fft         512,   256,   128
+        def_fft         1024,   512,   256
+        def_fft         2048,  1024,   512
+        def_fft         4096,  2048,  1024
+        def_fft         8192,  4096,  2048
+        def_fft         16384,  8192,  4096
+        def_fft         32768, 16384,  8192
+        def_fft         65536, 32768, 16384
 
 function ff_fft_calc_neon, export=1
         prfm            pldl1keep, [x1]

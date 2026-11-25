@@ -31,6 +31,7 @@
 #include "libavutil/pixfmt.h"
 
 #include "avcodec.h"
+#include "codec_internal.h"
 #include "internal.h"
 #include "thread.h"
 
@@ -45,6 +46,7 @@
                            AV_PIX_FMT_RGB48, AV_PIX_FMT_RGBA64
 
 #define GRAY_PIXEL_FORMATS AV_PIX_FMT_GRAY8, AV_PIX_FMT_YA8,                  \
+                           AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY14, \
                            AV_PIX_FMT_GRAY16, AV_PIX_FMT_YA16
 
 #define YUV_PIXEL_FORMATS  AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P, AV_PIX_FMT_YUVA420P, \
@@ -316,15 +318,12 @@ static av_cold int libopenjpeg_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int libopenjpeg_decode_frame(AVCodecContext *avctx,
-                                    void *data, int *got_frame,
-                                    AVPacket *avpkt)
+static int libopenjpeg_decode_frame(AVCodecContext *avctx, AVFrame *picture,
+                                    int *got_frame, AVPacket *avpkt)
 {
-    uint8_t *buf            = avpkt->data;
+    const uint8_t *buf      = avpkt->data;
     int buf_size            = avpkt->size;
     LibOpenJPEGContext *ctx = avctx->priv_data;
-    ThreadFrame frame       = { .f = data };
-    AVFrame *picture        = data;
     const AVPixFmtDescriptor *desc;
     int width, height, ret;
     int pixel_size = 0;
@@ -416,7 +415,7 @@ static int libopenjpeg_decode_frame(AVCodecContext *avctx,
         if (image->comps[i].prec > avctx->bits_per_raw_sample)
             avctx->bits_per_raw_sample = image->comps[i].prec;
 
-    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+    if ((ret = ff_thread_get_buffer(avctx, picture, 0)) < 0)
         goto done;
 
     ret = !opj_decode(dec, stream, image);
@@ -501,16 +500,16 @@ static const AVClass openjpeg_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVCodec ff_libopenjpeg_decoder = {
-    .name           = "libopenjpeg",
-    .long_name      = NULL_IF_CONFIG_SMALL("OpenJPEG JPEG 2000"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_JPEG2000,
+const FFCodec ff_libopenjpeg_decoder = {
+    .p.name         = "libopenjpeg",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("OpenJPEG JPEG 2000"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_JPEG2000,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
+    .p.max_lowres   = 31,
+    .p.priv_class   = &openjpeg_class,
+    .p.wrapper_name = "libopenjpeg",
     .priv_data_size = sizeof(LibOpenJPEGContext),
     .init           = libopenjpeg_decode_init,
-    .decode         = libopenjpeg_decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
-    .max_lowres     = 31,
-    .priv_class     = &openjpeg_class,
-    .wrapper_name   = "libopenjpeg",
+    FF_CODEC_DECODE_CB(libopenjpeg_decode_frame),
 };

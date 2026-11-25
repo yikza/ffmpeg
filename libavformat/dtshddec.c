@@ -24,6 +24,7 @@
 #include "libavcodec/dca.h"
 #include "avformat.h"
 #include "internal.h"
+#include "avio_internal.h"
 
 #define AUPR_HDR 0x415550522D484452
 #define AUPRINFO 0x41555052494E464F
@@ -43,7 +44,7 @@ typedef struct DTSHDDemuxContext {
     uint64_t    data_end;
 } DTSHDDemuxContext;
 
-static int dtshd_probe(AVProbeData *p)
+static int dtshd_probe(const AVProbeData *p)
 {
     if (AV_RB64(p->buf) == DTSHDHDR)
         return AVPROBE_SCORE_MAX;
@@ -65,7 +66,7 @@ static int dtshd_read_header(AVFormatContext *s)
         return AVERROR(ENOMEM);
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id   = AV_CODEC_ID_DTS;
-    st->need_parsing         = AVSTREAM_PARSE_FULL_RAW;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
 
     for (;;) {
         chunk_type = avio_rb64(pb);
@@ -104,7 +105,7 @@ static int dtshd_read_header(AVFormatContext *s)
             duration *= avio_rb16(pb); // samples_per_frames
             st->duration = duration;
             avio_skip(pb, 5);
-            st->codecpar->channels = ff_dca_count_chs_for_mask(avio_rb16(pb));
+            st->codecpar->ch_layout.nb_channels = ff_dca_count_chs_for_mask(avio_rb16(pb));
             st->codecpar->initial_padding = avio_rb16(pb);
             avio_skip(pb, chunk_size - 21);
             break;
@@ -114,7 +115,11 @@ static int dtshd_read_header(AVFormatContext *s)
             value = av_malloc(chunk_size);
             if (!value)
                 goto skip;
-            avio_read(pb, value, chunk_size);
+            ret = ffio_read_size(pb, value, chunk_size);
+            if (ret < 0) {
+                av_free(value);
+                goto skip;
+            }
             value[chunk_size - 1] = 0;
             av_dict_set(&s->metadata, "fileinfo", value,
                         AV_DICT_DONT_STRDUP_VAL);
@@ -159,7 +164,7 @@ static int raw_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-AVInputFormat ff_dtshd_demuxer = {
+const AVInputFormat ff_dtshd_demuxer = {
     .name           = "dtshd",
     .long_name      = NULL_IF_CONFIG_SMALL("raw DTS-HD"),
     .priv_data_size = sizeof(DTSHDDemuxContext),

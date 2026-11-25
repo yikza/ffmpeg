@@ -47,7 +47,7 @@ static const uint8_t ty_AC3AudioPacket[]  = { 0x00, 0x00, 0x01, 0xbd };
 #define CHUNK_PEEK_COUNT  3      /* number of chunks to probe */
 
 typedef struct TyRecHdr {
-    int64_t   rec_size;
+    int32_t   rec_size;
     uint8_t   ex[2];
     uint8_t   rec_type;
     uint8_t   subrec_type;
@@ -72,11 +72,6 @@ typedef enum {
     TIVO_AUDIO_MPEG
 } TiVo_audio;
 
-typedef struct TySeqTable {
-    uint64_t    timestamp;
-    uint8_t     chunk_bitmask[8];
-} TySeqTable;
-
 typedef struct TYDemuxContext {
     unsigned        cur_chunk;
     unsigned        cur_chunk_pos;
@@ -90,7 +85,6 @@ typedef struct TYDemuxContext {
     int             pes_buf_cnt;      /* how many bytes in our buffer */
     size_t          ac3_pkt_size;     /* length of ac3 pkt we've seen so far */
     uint64_t        last_ty_pts;      /* last TY timestamp we've seen */
-    unsigned        seq_table_size;   /* number of entries in SEQ table */
 
     int64_t         first_audio_pts;
     int64_t         last_audio_pts;
@@ -99,14 +93,12 @@ typedef struct TYDemuxContext {
     TyRecHdr       *rec_hdrs;         /* record headers array */
     int             cur_rec;          /* current record in this chunk */
     int             num_recs;         /* number of recs in this chunk */
-    int             seq_rec;          /* record number where seq start is */
-    TySeqTable     *seq_table;        /* table of SEQ entries from mstr chk */
     int             first_chunk;
 
     uint8_t         chunk[CHUNK_SIZE];
 } TYDemuxContext;
 
-static int ty_probe(AVProbeData *p)
+static int ty_probe(const AVProbeData *p)
 {
     int i;
 
@@ -254,7 +246,7 @@ static int analyze_chunk(AVFormatContext *s, const uint8_t *chunk)
             if (data_offset + hdrs[i].rec_size > CHUNK_SIZE)
                 break;
 
-            if ((hdrs[i].subrec_type << 0x08 | hdrs[i].rec_type) == 0x3c0 && hdrs[i].rec_size > 15) {
+            if ((hdrs[i].subrec_type << 8 | hdrs[i].rec_type) == 0x3c0 && hdrs[i].rec_size > 15) {
                 /* first make sure we're aligned */
                 int pes_offset = find_es_header(ty_MPEGAudioPacket,
                         &chunk[data_offset], 5);
@@ -316,7 +308,7 @@ static int ty_read_header(AVFormatContext *s)
         return AVERROR(ENOMEM);
     st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     st->codecpar->codec_id   = AV_CODEC_ID_MPEG2VIDEO;
-    st->need_parsing         = AVSTREAM_PARSE_FULL_RAW;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
     avpriv_set_pts_info(st, 64, 1, 90000);
 
     ast = avformat_new_stream(s, NULL);
@@ -326,7 +318,7 @@ static int ty_read_header(AVFormatContext *s)
 
     if (ty->audio_type == TIVO_AUDIO_MPEG) {
         ast->codecpar->codec_id = AV_CODEC_ID_MP2;
-        ast->need_parsing       = AVSTREAM_PARSE_FULL_RAW;
+        ffstream(ast)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
     } else {
         ast->codecpar->codec_id = AV_CODEC_ID_AC3;
     }
@@ -337,58 +329,6 @@ static int ty_read_header(AVFormatContext *s)
     avio_seek(pb, 0, SEEK_SET);
 
     return 0;
-}
-
-/* parse a master chunk, filling the SEQ table and other variables.
- * We assume the stream is currently pointing to it.
- */
-static void parse_master(AVFormatContext *s)
-{
-    TYDemuxContext *ty = s->priv_data;
-    unsigned map_size;  /* size of bitmask, in bytes */
-    unsigned i, j;
-
-    /* Note that the entries in the SEQ table in the stream may have
-       different sizes depending on the bits per entry.  We store them
-       all in the same size structure, so we have to parse them out one
-       by one.  If we had a dynamic structure, we could simply read the
-       entire table directly from the stream into memory in place. */
-
-    /* clear the SEQ table */
-    av_freep(&ty->seq_table);
-
-    /* parse header info */
-
-    map_size = AV_RB32(ty->chunk + 20);  /* size of bitmask, in bytes */
-    i = AV_RB32(ty->chunk + 28);   /* size of SEQ table, in bytes */
-
-    ty->seq_table_size = i / (8LL + map_size);
-
-    if (ty->seq_table_size == 0) {
-        ty->seq_table = NULL;
-        return;
-    }
-
-    /* parse all the entries */
-    ty->seq_table = av_calloc(ty->seq_table_size, sizeof(TySeqTable));
-    if (ty->seq_table == NULL) {
-        ty->seq_table_size = 0;
-        return;
-    }
-
-    ty->cur_chunk_pos = 32;
-    for (j = 0; j < ty->seq_table_size; j++) {
-        if (ty->cur_chunk_pos >= CHUNK_SIZE - 8)
-            return;
-        ty->seq_table[j].timestamp = AV_RB64(ty->chunk + ty->cur_chunk_pos);
-        ty->cur_chunk_pos += 8;
-        if (map_size > 8) {
-            av_log(s, AV_LOG_ERROR, "Unsupported SEQ bitmap size in master chunk.\n");
-            ty->cur_chunk_pos += map_size;
-        } else {
-            memcpy(ty->seq_table[j].chunk_bitmask, ty->chunk + ty->cur_chunk_pos, map_size);
-        }
-    }
 }
 
 static int get_chunk(AVFormatContext *s)
@@ -413,7 +353,7 @@ static int get_chunk(AVFormatContext *s)
 
     /* check if it's a PART Header */
     if (AV_RB32(ty->chunk) == TIVO_PES_FILEID) {
-        parse_master(s); /* parse master chunk */
+        /* skip master chunk and read new chunk */
         return get_chunk(s);
     }
 
@@ -421,14 +361,9 @@ static int get_chunk(AVFormatContext *s)
     if (ty->chunk[3] & 0x80) {
         /* 16 bit rec cnt */
         ty->num_recs = num_recs = (ty->chunk[1] << 8) + ty->chunk[0];
-        ty->seq_rec = (ty->chunk[3] << 8) + ty->chunk[2];
-        if (ty->seq_rec != 0xffff) {
-            ty->seq_rec &= ~0x8000;
-        }
     } else {
         /* 8 bit reclen - TiVo 1.3 format */
         ty->num_recs = num_recs = ty->chunk[0];
-        ty->seq_rec = ty->chunk[1];
     }
     ty->cur_rec = 0;
     ty->first_chunk = 0;
@@ -454,16 +389,20 @@ static int demux_video(AVFormatContext *s, TyRecHdr *rec_hdr, AVPacket *pkt)
     TYDemuxContext *ty = s->priv_data;
     const int subrec_type = rec_hdr->subrec_type;
     const int64_t rec_size = rec_hdr->rec_size;
-    int es_offset1;
+    int es_offset1, ret;
     int got_packet = 0;
 
     if (subrec_type != 0x02 && subrec_type != 0x0c &&
-        subrec_type != 0x08 && rec_size > 4) {
+        subrec_type != 0x08 && rec_size > 7) {
+
         /* get the PTS from this packet if it has one.
          * on S1, only 0x06 has PES.  On S2, however, most all do.
          * Do NOT Pass the PES Header to the MPEG2 codec */
         es_offset1 = find_es_header(ty_VideoPacket, ty->chunk + ty->cur_chunk_pos, 5);
         if (es_offset1 != -1) {
+            if (rec_size < es_offset1 + VIDEO_PTS_OFFSET + 5)
+                return AVERROR_INVALIDDATA;
+
             ty->last_video_pts = ff_parse_pes_pts(
                     ty->chunk + ty->cur_chunk_pos + es_offset1 + VIDEO_PTS_OFFSET);
             if (subrec_type != 0x06) {
@@ -474,8 +413,8 @@ static int demux_video(AVFormatContext *s, TyRecHdr *rec_hdr, AVPacket *pkt)
                     int size = rec_hdr->rec_size - VIDEO_PES_LENGTH - es_offset1;
 
                     ty->cur_chunk_pos += VIDEO_PES_LENGTH + es_offset1;
-                    if (av_new_packet(pkt, size) < 0)
-                        return AVERROR(ENOMEM);
+                    if ((ret = av_new_packet(pkt, size)) < 0)
+                        return ret;
                     memcpy(pkt->data, ty->chunk + ty->cur_chunk_pos, size);
                     ty->cur_chunk_pos += size;
                     pkt->stream_index = 0;
@@ -498,8 +437,8 @@ static int demux_video(AVFormatContext *s, TyRecHdr *rec_hdr, AVPacket *pkt)
     }
 
     if (!got_packet) {
-        if (av_new_packet(pkt, rec_size) < 0)
-            return AVERROR(ENOMEM);
+        if ((ret = av_new_packet(pkt, rec_size)) < 0)
+            return ret;
         memcpy(pkt->data, ty->chunk + ty->cur_chunk_pos, rec_size);
         ty->cur_chunk_pos += rec_size;
         pkt->stream_index = 0;
@@ -578,7 +517,7 @@ static int demux_audio(AVFormatContext *s, TyRecHdr *rec_hdr, AVPacket *pkt)
     TYDemuxContext *ty = s->priv_data;
     const int subrec_type = rec_hdr->subrec_type;
     const int64_t rec_size = rec_hdr->rec_size;
-    int es_offset1;
+    int es_offset1, ret;
 
     if (subrec_type == 2) {
         int need = 0;
@@ -621,8 +560,8 @@ static int demux_audio(AVFormatContext *s, TyRecHdr *rec_hdr, AVPacket *pkt)
             ty->pes_buf_cnt = 0;
 
         }
-        if (av_new_packet(pkt, rec_size - need) < 0)
-            return AVERROR(ENOMEM);
+        if ((ret = av_new_packet(pkt, rec_size - need)) < 0)
+            return ret;
         memcpy(pkt->data, ty->chunk + ty->cur_chunk_pos, rec_size - need);
         ty->cur_chunk_pos += rec_size - need;
         pkt->stream_index = 1;
@@ -643,8 +582,8 @@ static int demux_audio(AVFormatContext *s, TyRecHdr *rec_hdr, AVPacket *pkt)
             }
         }
     } else if (subrec_type == 0x03) {
-        if (av_new_packet(pkt, rec_size) < 0)
-            return AVERROR(ENOMEM);
+        if ((ret = av_new_packet(pkt, rec_size)) < 0)
+            return ret;
         memcpy(pkt->data, ty->chunk + ty->cur_chunk_pos, rec_size);
         ty->cur_chunk_pos += rec_size;
         pkt->stream_index = 1;
@@ -674,15 +613,15 @@ static int demux_audio(AVFormatContext *s, TyRecHdr *rec_hdr, AVPacket *pkt)
     } else if (subrec_type == 0x04) {
         /* SA Audio with no PES Header                      */
         /* ================================================ */
-        if (av_new_packet(pkt, rec_size) < 0)
-            return AVERROR(ENOMEM);
+        if ((ret = av_new_packet(pkt, rec_size)) < 0)
+            return ret;
         memcpy(pkt->data, ty->chunk + ty->cur_chunk_pos, rec_size);
         ty->cur_chunk_pos += rec_size;
         pkt->stream_index = 1;
         pkt->pts = ty->last_audio_pts;
     } else if (subrec_type == 0x09) {
-        if (av_new_packet(pkt, rec_size) < 0)
-            return AVERROR(ENOMEM);
+        if ((ret = av_new_packet(pkt, rec_size)) < 0)
+            return ret;
         memcpy(pkt->data, ty->chunk + ty->cur_chunk_pos, rec_size);
         ty->cur_chunk_pos += rec_size ;
         pkt->stream_index = 1;
@@ -770,13 +709,12 @@ static int ty_read_close(AVFormatContext *s)
 {
     TYDemuxContext *ty = s->priv_data;
 
-    av_freep(&ty->seq_table);
     av_freep(&ty->rec_hdrs);
 
     return 0;
 }
 
-AVInputFormat ff_ty_demuxer = {
+const AVInputFormat ff_ty_demuxer = {
     .name           = "ty",
     .long_name      = NULL_IF_CONFIG_SMALL("TiVo TY Stream"),
     .priv_data_size = sizeof(TYDemuxContext),

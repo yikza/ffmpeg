@@ -37,7 +37,7 @@ static inline int RENAME(get_context)(PlaneContext *p, TYPE *src,
     const int RT = last[1];
     const int L  = src[-1];
 
-    if (p->quant_table[3][127]) {
+    if (p->quant_table[3][127] || p->quant_table[4][127]) {
         const int TT = last2[0];
         const int LL = src[-2];
         return p->quant_table[0][(L - LT) & 0xFF] +
@@ -50,4 +50,3 @@ static inline int RENAME(get_context)(PlaneContext *p, TYPE *src,
                p->quant_table[1][(LT - T) & 0xFF] +
                p->quant_table[2][(T - RT) & 0xFF];
 }
-

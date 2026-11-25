@@ -20,6 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "avcodec.h"
 #include "internal.h"
 #include "mjpegdec.h"
@@ -66,7 +68,7 @@ static int nvdec_mjpeg_frame_params(AVCodecContext *avctx,
                                   AVBufferRef *hw_frames_ctx)
 {
     // Only need storage for the current frame
-    return ff_nvdec_frame_params(avctx, hw_frames_ctx, 1);
+    return ff_nvdec_frame_params(avctx, hw_frames_ctx, 1, 0);
 }
 
 #if CONFIG_MJPEG_NVDEC_HWACCEL

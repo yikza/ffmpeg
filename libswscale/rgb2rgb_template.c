@@ -402,11 +402,11 @@ static inline void yuvPlanartoyuy2_c(const uint8_t *ysrc, const uint8_t *usrc,
 
         for (i = 0; i < chromWidth; i++) {
 #if HAVE_BIGENDIAN
-            *idst++ = (yc[0] << 24) + (uc[0] << 16) +
+            *idst++ = ((unsigned)yc[0] << 24) + (uc[0] << 16) +
                       (yc[1] <<  8) + (vc[0] <<  0);
 #else
             *idst++ = yc[0] + (uc[0] << 8) +
-                      (yc[1] << 16) + (vc[0] << 24);
+                      (yc[1] << 16) + ((unsigned)vc[0] << 24);
 #endif
             yc += 2;
             uc++;
@@ -466,11 +466,11 @@ static inline void yuvPlanartouyvy_c(const uint8_t *ysrc, const uint8_t *usrc,
 
         for (i = 0; i < chromWidth; i++) {
 #if HAVE_BIGENDIAN
-            *idst++ = (uc[0] << 24) + (yc[0] << 16) +
+            *idst++ = ((unsigned)uc[0] << 24) + (yc[0] << 16) +
                       (vc[0] <<  8) + (yc[1] <<  0);
 #else
             *idst++ = uc[0] + (yc[0] << 8) +
-                      (vc[0] << 16) + (yc[1] << 24);
+                      (vc[0] << 16) + ((unsigned)yc[1] << 24);
 #endif
             yc += 2;
             uc++;
@@ -967,10 +967,10 @@ static av_cold void rgb2rgb_init_c(void)
 #else
     shuffle_bytes_0321 = shuffle_bytes_0321_c;
     shuffle_bytes_2103 = shuffle_bytes_2103_c;
+#endif
     shuffle_bytes_1230 = shuffle_bytes_1230_c;
     shuffle_bytes_3012 = shuffle_bytes_3012_c;
     shuffle_bytes_3210 = shuffle_bytes_3210_c;
-#endif
     rgb32tobgr16       = rgb32tobgr16_c;
     rgb32tobgr15       = rgb32tobgr15_c;
     yv12toyuy2         = yv12toyuy2_c;

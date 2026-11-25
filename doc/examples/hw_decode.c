@@ -4,21 +4,23 @@
  *
  * HW Acceleration API (video decoding) decode sample
  *
- * This file is part of FFmpeg.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- * FFmpeg is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
  *
- * FFmpeg is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with FFmpeg; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
  */
 
 /**
@@ -150,8 +152,8 @@ int main(int argc, char *argv[])
     int video_stream, ret;
     AVStream *video = NULL;
     AVCodecContext *decoder_ctx = NULL;
-    AVCodec *decoder = NULL;
-    AVPacket packet;
+    const AVCodec *decoder = NULL;
+    AVPacket *packet = NULL;
     enum AVHWDeviceType type;
     int i;
 
@@ -167,6 +169,12 @@ int main(int argc, char *argv[])
         while((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE)
             fprintf(stderr, " %s", av_hwdevice_get_type_name(type));
         fprintf(stderr, "\n");
+        return -1;
+    }
+
+    packet = av_packet_alloc();
+    if (!packet) {
+        fprintf(stderr, "Failed to allocate AVPacket\n");
         return -1;
     }
 
@@ -211,7 +219,6 @@ int main(int argc, char *argv[])
         return -1;
 
     decoder_ctx->get_format  = get_hw_format;
-    av_opt_set_int(decoder_ctx, "refcounted_frames", 1, 0);
 
     if (hw_decoder_init(decoder_ctx, type) < 0)
         return -1;
@@ -222,27 +229,25 @@ int main(int argc, char *argv[])
     }
 
     /* open the file to dump raw data */
-    output_file = fopen(argv[3], "w+");
+    output_file = fopen(argv[3], "w+b");
 
     /* actual decoding and dump the raw data */
     while (ret >= 0) {
-        if ((ret = av_read_frame(input_ctx, &packet)) < 0)
+        if ((ret = av_read_frame(input_ctx, packet)) < 0)
             break;
 
-        if (video_stream == packet.stream_index)
-            ret = decode_write(decoder_ctx, &packet);
+        if (video_stream == packet->stream_index)
+            ret = decode_write(decoder_ctx, packet);
 
-        av_packet_unref(&packet);
+        av_packet_unref(packet);
     }
 
     /* flush the decoder */
-    packet.data = NULL;
-    packet.size = 0;
-    ret = decode_write(decoder_ctx, &packet);
-    av_packet_unref(&packet);
+    ret = decode_write(decoder_ctx, NULL);
 
     if (output_file)
         fclose(output_file);
+    av_packet_free(&packet);
     avcodec_free_context(&decoder_ctx);
     avformat_close_input(&input_ctx);
     av_buffer_unref(&hw_device_ctx);

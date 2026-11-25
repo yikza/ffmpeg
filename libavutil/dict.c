@@ -19,6 +19,8 @@
  */
 
 #include <string.h>
+#include <errno.h>
+#include <inttypes.h>
 
 #include "avstring.h"
 #include "dict.h"
@@ -42,7 +44,7 @@ AVDictionaryEntry *av_dict_get(const AVDictionary *m, const char *key,
 {
     unsigned int i, j;
 
-    if (!m || !key)
+    if (!m)
         return NULL;
 
     if (prev)
@@ -103,8 +105,8 @@ int av_dict_set(AVDictionary **pm, const char *key, const char *value,
         av_free(tag->key);
         *tag = m->elems[--m->count];
     } else if (copy_value) {
-        AVDictionaryEntry *tmp = av_realloc(m->elems,
-                                            (m->count + 1) * sizeof(*m->elems));
+        AVDictionaryEntry *tmp = av_realloc_array(m->elems,
+                                                  m->count + 1, sizeof(*m->elems));
         if (!tmp)
             goto err_out;
         m->elems = tmp;
@@ -153,40 +155,37 @@ int av_dict_set_int(AVDictionary **pm, const char *key, int64_t value,
     return av_dict_set(pm, key, valuestr, flags);
 }
 
-int av_dict_set_intptr(AVDictionary **pm, const char *key, uintptr_t value,
-                int flags)
+int av_dict_set_intptr(AVDictionary **pm, const char *key, uintptr_t value, int flags)
 {
-    char valuestr[22];
-    snprintf(valuestr, sizeof(valuestr), "%p", value);
+    char valuestr[2 + 2 * sizeof(uintptr_t) + 1];
+    snprintf(valuestr, sizeof(valuestr), "0x%"PRIxPTR, value);
     flags &= ~AV_DICT_DONT_STRDUP_VAL;
     return av_dict_set(pm, key, valuestr, flags);
 }
 
-uintptr_t av_dict_get_intptr(const AVDictionary *m, const char* key) {
-    uintptr_t ptr = NULL;
-    AVDictionaryEntry *t = NULL;
-    if ((t = av_dict_get(m, key, NULL, 0))) {
-      return av_dict_strtoptr(t->value);
-    }
-    return NULL;
+uintptr_t av_dict_get_intptr(const AVDictionary *m, const char *key)
+{
+    AVDictionaryEntry *entry = av_dict_get(m, key, NULL, 0);
+    return entry ? av_dict_strtoptr(entry->value) : 0;
 }
 
-uintptr_t av_dict_strtoptr(char * value) {
-   uintptr_t ptr = NULL;
-   char *next = NULL;
-   if(!value || value[0] !='0' || (value[1]|0x20)!='x') {
-       return NULL;
-   }
-   ptr = strtoull(value, &next, 16);
-   if (next == value) {
-       return NULL;
-   }
-   return ptr;
+uintptr_t av_dict_strtoptr(char *value)
+{
+    uintmax_t parsed;
+    char *next;
+    if (!value || value[0] != '0' || (value[1] | 0x20) != 'x')
+        return 0;
+    errno = 0;
+    parsed = strtoumax(value, &next, 16);
+    if (errno == ERANGE || next == value || *next || parsed > UINTPTR_MAX)
+        return 0;
+    return (uintptr_t)parsed;
 }
 
-char * av_dict_ptrtostr(uintptr_t value) {
-    char valuestr[22] = {0};
-    snprintf(valuestr, sizeof(valuestr), "%p", value);
+char *av_dict_ptrtostr(uintptr_t value)
+{
+    char valuestr[2 + 2 * sizeof(uintptr_t) + 1];
+    snprintf(valuestr, sizeof(valuestr), "0x%"PRIxPTR, value);
     return av_strdup(valuestr);
 }
 

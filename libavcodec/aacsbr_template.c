@@ -34,6 +34,14 @@
 
 #include "libavutil/qsort.h"
 
+static av_cold void aacsbr_tableinit(void)
+{
+    int n;
+
+    for (n = 0; n < 320; n++)
+        sbr_qmf_window_ds[n] = sbr_qmf_window_us[2*n];
+}
+
 av_cold void AAC_RENAME(ff_aac_sbr_init)(void)
 {
     static const struct {
@@ -580,6 +588,7 @@ static int sbr_make_f_derived(AACContext *ac, SpectralBandReplication *sbr)
 
     if (sbr->n_q > 5) {
         av_log(ac->avctx, AV_LOG_ERROR, "Too many noise floor scale factors: %d\n", sbr->n_q);
+        sbr->n_q = 1;
         return -1;
     }
 
@@ -803,7 +812,7 @@ static int read_sbr_envelope(AACContext *ac, SpectralBandReplication *sbr, GetBi
 {
     int bits;
     int i, j, k;
-    VLC_TYPE (*t_huff)[2], (*f_huff)[2];
+    const VLCElem *t_huff, *f_huff;
     int t_lav, f_lav;
     const int delta = (ch == 1 && sbr->bs_coupling == 1) + 1;
     const int odd = sbr->n[1] & 1;
@@ -891,7 +900,7 @@ static int read_sbr_noise(AACContext *ac, SpectralBandReplication *sbr, GetBitCo
                            SBRData *ch_data, int ch)
 {
     int i, j;
-    VLC_TYPE (*t_huff)[2], (*f_huff)[2];
+    const VLCElem *t_huff, *f_huff;
     int t_lav, f_lav;
     int delta = (ch == 1 && sbr->bs_coupling == 1) + 1;
 
@@ -945,7 +954,7 @@ static void read_sbr_extension(AACContext *ac, SpectralBandReplication *sbr,
             skip_bits_long(gb, *num_bits_left); // bs_fill_bits
             *num_bits_left = 0;
         } else {
-            *num_bits_left -= AAC_RENAME(ff_ps_read_data)(ac->avctx, gb, &sbr->ps, *num_bits_left);
+            *num_bits_left -= ff_ps_read_data(ac->avctx, gb, &sbr->ps.common, *num_bits_left);
             ac->avctx->profile = FF_PROFILE_AAC_HE_V2;
         }
         break;
@@ -1421,6 +1430,9 @@ static void sbr_env_estimate(AAC_FLOAT (*e_curr)[48], INTFLOAT X_high[64][40][2]
             int ilb = ch_data->t_env[e]     * 2 + ENVELOPE_ADJUSTMENT_OFFSET;
             int iub = ch_data->t_env[e + 1] * 2 + ENVELOPE_ADJUSTMENT_OFFSET;
 
+            if (ilb >= 40)
+                return;
+
             for (m = 0; m < sbr->m[1]; m++) {
                 AAC_FLOAT sum = sbr->dsp.sum_square(X_high[m+kx1] + ilb, iub - ilb);
 #if USE_FIXED
@@ -1438,6 +1450,9 @@ static void sbr_env_estimate(AAC_FLOAT (*e_curr)[48], INTFLOAT X_high[64][40][2]
             int ilb = ch_data->t_env[e]     * 2 + ENVELOPE_ADJUSTMENT_OFFSET;
             int iub = ch_data->t_env[e + 1] * 2 + ENVELOPE_ADJUSTMENT_OFFSET;
             const uint16_t *table = ch_data->bs_freq_res[e + 1] ? sbr->f_tablehigh : sbr->f_tablelow;
+
+            if (ilb >= 40)
+                return;
 
             for (p = 0; p < sbr->n[ch_data->bs_freq_res[e + 1]]; p++) {
 #if USE_FIXED
@@ -1536,7 +1551,7 @@ void AAC_RENAME(ff_sbr_apply)(AACContext *ac, SpectralBandReplication *sbr, int 
     }
 
     if (ac->oc[1].m4ac.ps == 1) {
-        if (sbr->ps.start) {
+        if (sbr->ps.common.start) {
             AAC_RENAME(ff_ps_apply)(ac->avctx, &sbr->ps, sbr->X[0], sbr->X[1], sbr->kx[1] + sbr->m[1]);
         } else {
             memcpy(sbr->X[1], sbr->X[0], sizeof(sbr->X[0]));
@@ -1565,7 +1580,8 @@ static void aacsbr_func_ptr_init(AACSBRContext *c)
     c->sbr_hf_inverse_filter = sbr_hf_inverse_filter;
 
 #if !USE_FIXED
-    if(ARCH_MIPS)
-        ff_aacsbr_func_ptr_init_mips(c);
+#if ARCH_MIPS
+    ff_aacsbr_func_ptr_init_mips(c);
+#endif
 #endif
 }

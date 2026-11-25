@@ -43,6 +43,7 @@
 
 #include "network.h"
 
+#if !HAVE_GETADDRINFO
 #if !HAVE_INET_ATON
 #include <stdlib.h>
 
@@ -62,7 +63,6 @@ static int inet_aton(const char *str, struct in_addr *add)
 }
 #endif /* !HAVE_INET_ATON */
 
-#if !HAVE_GETADDRINFO
 int ff_getaddrinfo(const char *node, const char *service,
                    const struct addrinfo *hints, struct addrinfo **res)
 {
@@ -80,7 +80,7 @@ int ff_getaddrinfo(const char *node, const char *service,
         if (!inet_aton(node, &sin->sin_addr)) {
             if (hints && (hints->ai_flags & AI_NUMERICHOST)) {
                 av_free(sin);
-                return EAI_FAIL;
+                return EAI_NONAME;
             }
             h = gethostbyname(node);
             if (!h) {

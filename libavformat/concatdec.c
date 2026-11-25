@@ -18,14 +18,17 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
+#include "libavutil/avassert.h"
 #include "libavutil/bprint.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/timestamp.h"
+#include "libavcodec/bsf.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "url.h"
 
@@ -45,11 +48,13 @@ typedef struct {
     int64_t file_start_time;
     int64_t file_inpoint;
     int64_t duration;
+    int64_t user_duration;
     int64_t next_dts;
     ConcatStream *streams;
     int64_t inpoint;
     int64_t outpoint;
     AVDictionary *metadata;
+    AVDictionary *options;
     int nb_streams;
 } ConcatFile;
 
@@ -65,11 +70,9 @@ typedef struct {
     ConcatMatchMode stream_match_mode;
     unsigned auto_convert;
     int segment_time_metadata;
-    AVDictionary *options;
-    int error;
 } ConcatContext;
 
-static int concat_probe(AVProbeData *probe)
+static int concat_probe(const AVProbeData *probe)
 {
     return memcmp(probe->buf, "ffconcat version 1.0", 20) ?
            0 : AVPROBE_SCORE_MAX;
@@ -114,18 +117,18 @@ static int add_file(AVFormatContext *avf, char *filename, ConcatFile **rfile,
     ConcatFile *file;
     char *url = NULL;
     const char *proto;
-    size_t url_len, proto_len;
+    const char *ptr;
+    size_t url_len;
     int ret;
 
-    if (cat->safe > 0 && !safe_filename(filename)) {
+    if (cat->safe && !safe_filename(filename)) {
         av_log(avf, AV_LOG_ERROR, "Unsafe file name '%s'\n", filename);
         FAIL(AVERROR(EPERM));
     }
 
     proto = avio_find_protocol_name(filename);
-    proto_len = proto ? strlen(proto) : 0;
-    if (proto && !memcmp(filename, proto, proto_len) &&
-        (filename[proto_len] == ':' || filename[proto_len] == ',')) {
+    if (proto && av_strstart(filename, proto, &ptr) &&
+        (*ptr == ':' || *ptr == ',')) {
         url = filename;
         filename = NULL;
     } else {
@@ -156,6 +159,7 @@ static int add_file(AVFormatContext *avf, char *filename, ConcatFile **rfile,
     file->next_dts   = AV_NOPTS_VALUE;
     file->inpoint    = AV_NOPTS_VALUE;
     file->outpoint   = AV_NOPTS_VALUE;
+    file->user_duration = AV_NOPTS_VALUE;
 
     return 0;
 
@@ -171,10 +175,6 @@ static int copy_stream_props(AVStream *st, AVStream *source_st)
 
     if (st->codecpar->codec_id || !source_st->codecpar->codec_id) {
         if (st->codecpar->extradata_size < source_st->codecpar->extradata_size) {
-            if (st->codecpar->extradata) {
-                av_freep(&st->codecpar->extradata);
-                st->codecpar->extradata_size = 0;
-            }
             ret = ff_alloc_extradata(st->codecpar,
                                      source_st->codecpar->extradata_size);
             if (ret < 0)
@@ -192,6 +192,7 @@ static int copy_stream_props(AVStream *st, AVStream *source_st)
     avpriv_set_pts_info(st, 64, source_st->time_base.num, source_st->time_base.den);
 
     av_dict_copy(&st->metadata, source_st->metadata, 0);
+    ff_stream_side_data_copy(st, source_st);
     return 0;
 }
 
@@ -316,80 +317,68 @@ static int match_streams(AVFormatContext *avf)
     return 0;
 }
 
+static int64_t get_best_effort_duration(ConcatFile *file, AVFormatContext *avf)
+{
+    if (file->user_duration != AV_NOPTS_VALUE)
+        return file->user_duration;
+    if (file->outpoint != AV_NOPTS_VALUE)
+        return av_sat_sub64(file->outpoint, file->file_inpoint);
+    if (avf->duration > 0)
+        return av_sat_sub64(avf->duration, file->file_inpoint - file->file_start_time);
+    if (file->next_dts != AV_NOPTS_VALUE)
+        return file->next_dts - file->file_inpoint;
+    return AV_NOPTS_VALUE;
+}
+
 static int open_file(AVFormatContext *avf, unsigned fileno)
 {
     ConcatContext *cat = avf->priv_data;
     ConcatFile *file = &cat->files[fileno];
-    AVFormatContext *new_avf = NULL;
+    AVDictionary *options = NULL;
     int ret;
-    AVDictionary *tmp = NULL;
-    AVDictionaryEntry *t = NULL;
-    int fps_flag = 0;
-
-    new_avf = avformat_alloc_context();
-    if (!new_avf)
-        return AVERROR(ENOMEM);
-
-    new_avf->flags |= avf->flags & ~AVFMT_FLAG_CUSTOM_IO;
-
-#ifdef FF_API_LAVF_KEEPSIDE_FLAG
-    if (avf->flags & AVFMT_FLAG_KEEP_SIDE_DATA) {
-        new_avf->flags |= AVFMT_FLAG_KEEP_SIDE_DATA;
-    }
-#endif
-    new_avf->interrupt_callback = avf->interrupt_callback;
-
-    if ((ret = ff_copy_whiteblacklists(new_avf, avf)) < 0)
-        return ret;
-
-    if (cat->options)
-        av_dict_copy(&tmp, cat->options, 0);
-
-    av_dict_set_int(&tmp, "cur_file_no", fileno, 0);
-
-    t = av_dict_get(tmp, "skip-calc-frame-rate", NULL, AV_DICT_MATCH_CASE);
-    if (t) {
-        fps_flag = (int) strtol(t->value, NULL, 10);
-        if (fps_flag > 0) {
-            av_dict_set_int(&new_avf->metadata, "skip-calc-frame-rate", fps_flag, 0);
-        }
-    }
-
-    t = av_dict_get(tmp, "nb-streams", NULL, AV_DICT_MATCH_CASE);
-    if (t) {
-        int nb_streams = (int) strtol(t->value, NULL, 10);
-        if (nb_streams > 0) {
-            av_dict_set_int(&new_avf->metadata, "nb-streams", nb_streams, 0);
-            av_dict_set_int(&cat->options, "nb-streams", 0, 0);
-        }
-    }
-
-    ret = avformat_open_input(&new_avf, file->url, NULL, &tmp);
-    av_dict_free(&tmp);
-    if (ret < 0 ||
-        (ret = avformat_find_stream_info(new_avf, NULL)) < 0) {
-        av_log(avf, AV_LOG_ERROR, "Impossible to open '%s'\n", file->url);
-        avformat_close_input(&new_avf);
-        return ret;
-    }
-
-    if (!new_avf)
-        return 0;
 
     if (cat->avf)
         avformat_close_input(&cat->avf);
 
-    avf->bit_rate = new_avf->bit_rate;
-    cat->avf      = new_avf;
+    cat->avf = avformat_alloc_context();
+    if (!cat->avf)
+        return AVERROR(ENOMEM);
+
+    cat->avf->flags |= avf->flags & ~AVFMT_FLAG_CUSTOM_IO;
+    cat->avf->interrupt_callback = avf->interrupt_callback;
+
+    if ((ret = ff_copy_whiteblacklists(cat->avf, avf)) < 0)
+        return ret;
+
+    ret = av_dict_copy(&options, file->options, 0);
+    if (ret < 0)
+        return ret;
+
+    ret = av_dict_set_int(&options, "cur_file_no", fileno, 0);
+    if (ret < 0) {
+        av_dict_free(&options);
+        return ret;
+    }
+
+    if ((ret = avformat_open_input(&cat->avf, file->url, NULL, &options)) < 0 ||
+        (ret = avformat_find_stream_info(cat->avf, NULL)) < 0) {
+        av_log(avf, AV_LOG_ERROR, "Impossible to open '%s'\n", file->url);
+        av_dict_free(&options);
+        avformat_close_input(&cat->avf);
+        return ret;
+    }
+    if (options) {
+        av_log(avf, AV_LOG_WARNING, "Unused options for '%s'.\n", file->url);
+        /* TODO log unused options once we have a proper string API */
+        av_dict_free(&options);
+    }
     cat->cur_file = file;
-    if (file->start_time == AV_NOPTS_VALUE)
-        file->start_time = !fileno ? 0 :
-                           cat->files[fileno - 1].start_time +
-                           cat->files[fileno - 1].duration;
+    file->start_time = !fileno ? 0 :
+                       cat->files[fileno - 1].start_time +
+                       cat->files[fileno - 1].duration;
     file->file_start_time = (cat->avf->start_time == AV_NOPTS_VALUE) ? 0 : cat->avf->start_time;
     file->file_inpoint = (file->inpoint == AV_NOPTS_VALUE) ? file->file_start_time : file->inpoint;
-    if (file->duration == AV_NOPTS_VALUE && file->outpoint != AV_NOPTS_VALUE)
-        file->duration = file->outpoint - file->file_inpoint;
+    file->duration = get_best_effort_duration(file, cat->avf);
 
     if (cat->segment_time_metadata) {
         av_dict_set_int(&file->metadata, "lavf.concatdec.start_time", file->start_time, 0);
@@ -419,26 +408,74 @@ static int concat_read_close(AVFormatContext *avf)
         }
         av_freep(&cat->files[i].streams);
         av_dict_free(&cat->files[i].metadata);
+        av_dict_free(&cat->files[i].options);
     }
     if (cat->avf)
         avformat_close_input(&cat->avf);
-    av_dict_free(&cat->options);
     av_freep(&cat->files);
     return 0;
 }
 
-static int concat_read_header(AVFormatContext *avf, AVDictionary **options)
+#define MAX_ARGS 3
+#define NEEDS_UNSAFE   (1 << 0)
+#define NEEDS_FILE     (1 << 1)
+#define NEEDS_STREAM   (1 << 2)
+
+typedef struct ParseSyntax {
+    const char *keyword;
+    char args[MAX_ARGS];
+    uint8_t flags;
+} ParseSyntax;
+
+typedef enum ParseDirective {
+   DIR_FFCONCAT,
+   DIR_FILE,
+   DIR_DURATION,
+   DIR_INPOINT,
+   DIR_OUTPOINT,
+   DIR_FPMETA,
+   DIR_FPMETAS,
+   DIR_OPTION,
+   DIR_STREAM,
+   DIR_EXSID,
+   DIR_STMETA,
+   DIR_STCODEC,
+   DIR_STEDATA,
+   DIR_CHAPTER,
+} ParseDirective;
+
+static const ParseSyntax syntax[] = {
+    [DIR_FFCONCAT ] = { "ffconcat",             "kk",   0 },
+    [DIR_FILE     ] = { "file",                 "s",    0 },
+    [DIR_DURATION ] = { "duration",             "d",    NEEDS_FILE },
+    [DIR_INPOINT  ] = { "inpoint",              "d",    NEEDS_FILE },
+    [DIR_OUTPOINT ] = { "outpoint",             "d",    NEEDS_FILE },
+    [DIR_FPMETA   ] = { "file_packet_meta",     "ks",   NEEDS_FILE },
+    [DIR_FPMETAS  ] = { "file_packet_metadata", "s",    NEEDS_FILE },
+    [DIR_OPTION   ] = { "option",               "ks",   NEEDS_FILE | NEEDS_UNSAFE },
+    [DIR_STREAM   ] = { "stream",               "",     0 },
+    [DIR_EXSID    ] = { "exact_stream_id",      "i",    NEEDS_STREAM },
+    [DIR_STMETA   ] = { "stream_meta",          "ks",   NEEDS_STREAM },
+    [DIR_STCODEC  ] = { "stream_codec",         "k",    NEEDS_STREAM },
+    [DIR_STEDATA  ] = { "stream_extradata",     "k",    NEEDS_STREAM },
+    [DIR_CHAPTER  ] = { "chapter",              "idd",  0 },
+};
+
+static int concat_parse_script(AVFormatContext *avf)
 {
     ConcatContext *cat = avf->priv_data;
+    unsigned nb_files_alloc = 0;
     AVBPrint bp;
     uint8_t *cursor, *keyword;
-    int line = 0, i;
-    unsigned nb_files_alloc = 0;
     ConcatFile *file = NULL;
-    int64_t ret, time = 0;
-
-    if (options && *options)
-        av_dict_copy(&cat->options, *options, 0);
+    AVStream *stream = NULL;
+    AVChapter *chapter = NULL;
+    unsigned line = 0, arg;
+    const ParseSyntax *dir;
+    char *arg_kw[MAX_ARGS];
+    char *arg_str[MAX_ARGS] = { 0 };
+    int64_t arg_int[MAX_ARGS];
+    int ret;
 
     av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
 
@@ -448,94 +485,213 @@ static int concat_read_header(AVFormatContext *avf, AVDictionary **options)
         keyword = get_keyword(&cursor);
         if (!*keyword || *keyword == '#')
             continue;
-
-        if (!strcmp(keyword, "file")) {
-            char *filename = av_get_token((const char **)&cursor, SPACE_CHARS);
-            if (!filename) {
-                av_log(avf, AV_LOG_ERROR, "Line %d: filename required\n", line);
-                FAIL(AVERROR_INVALIDDATA);
-            }
-            if ((ret = add_file(avf, filename, &file, &nb_files_alloc)) < 0)
-                goto fail;
-        } else if (!strcmp(keyword, "duration") || !strcmp(keyword, "inpoint") || !strcmp(keyword, "outpoint")) {
-            char *dur_str = get_keyword(&cursor);
-            int64_t dur;
-            if (!file) {
-                av_log(avf, AV_LOG_ERROR, "Line %d: %s without file\n",
-                       line, keyword);
-                FAIL(AVERROR_INVALIDDATA);
-            }
-            if ((ret = av_parse_time(&dur, dur_str, 1)) < 0) {
-                av_log(avf, AV_LOG_ERROR, "Line %d: invalid %s '%s'\n",
-                       line, keyword, dur_str);
-                goto fail;
-            }
-            if (!strcmp(keyword, "duration"))
-                file->duration = dur;
-            else if (!strcmp(keyword, "inpoint"))
-                file->inpoint = dur;
-            else if (!strcmp(keyword, "outpoint"))
-                file->outpoint = dur;
-        } else if (!strcmp(keyword, "file_packet_metadata")) {
-            char *metadata;
-            if (!file) {
-                av_log(avf, AV_LOG_ERROR, "Line %d: %s without file\n",
-                       line, keyword);
-                FAIL(AVERROR_INVALIDDATA);
-            }
-            metadata = av_get_token((const char **)&cursor, SPACE_CHARS);
-            if (!metadata) {
-                av_log(avf, AV_LOG_ERROR, "Line %d: packet metadata required\n", line);
-                FAIL(AVERROR_INVALIDDATA);
-            }
-            if ((ret = av_dict_parse_string(&file->metadata, metadata, "=", "", 0)) < 0) {
-                av_log(avf, AV_LOG_ERROR, "Line %d: failed to parse metadata string\n", line);
-                av_freep(&metadata);
-                FAIL(AVERROR_INVALIDDATA);
-            }
-            av_freep(&metadata);
-        } else if (!strcmp(keyword, "stream")) {
-            if (!avformat_new_stream(avf, NULL))
-                FAIL(AVERROR(ENOMEM));
-        } else if (!strcmp(keyword, "exact_stream_id")) {
-            if (!avf->nb_streams) {
-                av_log(avf, AV_LOG_ERROR, "Line %d: exact_stream_id without stream\n",
-                       line);
-                FAIL(AVERROR_INVALIDDATA);
-            }
-            avf->streams[avf->nb_streams - 1]->id =
-                strtol(get_keyword(&cursor), NULL, 0);
-        } else if (!strcmp(keyword, "ffconcat")) {
-            char *ver_kw  = get_keyword(&cursor);
-            char *ver_val = get_keyword(&cursor);
-            if (strcmp(ver_kw, "version") || strcmp(ver_val, "1.0")) {
-                av_log(avf, AV_LOG_ERROR, "Line %d: invalid version\n", line);
-                FAIL(AVERROR_INVALIDDATA);
-            }
-            if (cat->safe < 0)
-                cat->safe = 1;
-        } else {
+        for (dir = syntax; dir < syntax + FF_ARRAY_ELEMS(syntax); dir++)
+            if (!strcmp(dir->keyword, keyword))
+                break;
+        if (dir >= syntax + FF_ARRAY_ELEMS(syntax)) {
             av_log(avf, AV_LOG_ERROR, "Line %d: unknown keyword '%s'\n",
                    line, keyword);
             FAIL(AVERROR_INVALIDDATA);
         }
+
+        /* Flags check */
+        if ((dir->flags & NEEDS_UNSAFE) && cat->safe) {
+            av_log(avf, AV_LOG_ERROR, "Line %d: %s not allowed if safe\n", line, keyword);
+            FAIL(AVERROR_INVALIDDATA);
+        }
+        if ((dir->flags & NEEDS_FILE) && !cat->nb_files) {
+            av_log(avf, AV_LOG_ERROR, "Line %d: %s without file\n", line, keyword);
+            FAIL(AVERROR_INVALIDDATA);
+        }
+        if ((dir->flags & NEEDS_STREAM) && !avf->nb_streams) {
+            av_log(avf, AV_LOG_ERROR, "Line %d: %s without stream\n", line, keyword);
+            FAIL(AVERROR_INVALIDDATA);
+        }
+
+        /* Arguments parsing */
+        for (arg = 0; arg < FF_ARRAY_ELEMS(dir->args) && dir->args[arg]; arg++) {
+            switch (dir->args[arg]) {
+            case 'd': /* duration */
+                arg_kw[arg] = get_keyword(&cursor);
+                ret = av_parse_time(&arg_int[arg], arg_kw[arg], 1);
+                if (ret < 0) {
+                    av_log(avf, AV_LOG_ERROR, "Line %d: invalid duration '%s'\n",
+                           line, arg_kw[arg]);
+                    goto fail;
+                }
+                break;
+            case 'i': /* integer */
+                arg_int[arg] = strtol(get_keyword(&cursor), NULL, 0);
+                break;
+            case 'k': /* keyword */
+                arg_kw[arg] = get_keyword(&cursor);
+                break;
+            case 's': /* string */
+                av_assert0(!arg_str[arg]);
+                arg_str[arg] = av_get_token((const char **)&cursor, SPACE_CHARS);
+                if (!arg_str[arg])
+                    FAIL(AVERROR(ENOMEM));
+                if (!*arg_str[arg]) {
+                    av_log(avf, AV_LOG_ERROR, "Line %d: string required\n", line);
+                    FAIL(AVERROR_INVALIDDATA);
+                }
+                break;
+            default:
+                FAIL(AVERROR_BUG);
+            }
+        }
+
+        /* Directive action */
+        switch ((ParseDirective)(dir - syntax)) {
+
+        case DIR_FFCONCAT:
+            if (strcmp(arg_kw[0], "version") || strcmp(arg_kw[1], "1.0")) {
+                av_log(avf, AV_LOG_ERROR, "Line %d: invalid version\n", line);
+                FAIL(AVERROR_INVALIDDATA);
+            }
+            break;
+
+        case DIR_FILE:
+            ret = add_file(avf, arg_str[0], &file, &nb_files_alloc);
+            arg_str[0] = NULL;
+            if (ret < 0)
+                goto fail;
+            break;
+
+        case DIR_DURATION:
+            file->user_duration = arg_int[0];
+            break;
+
+        case DIR_INPOINT:
+            file->inpoint = arg_int[0];
+            break;
+
+        case DIR_OUTPOINT:
+            file->outpoint = arg_int[0];
+            break;
+
+        case DIR_FPMETA:
+            ret = av_dict_set(&file->metadata, arg_kw[0], arg_str[1], AV_DICT_DONT_STRDUP_VAL);
+            arg_str[1] = NULL;
+            if (ret < 0)
+                FAIL(ret);
+            break;
+
+        case DIR_FPMETAS:
+            if ((ret = av_dict_parse_string(&file->metadata, arg_str[0], "=", "", 0)) < 0) {
+                av_log(avf, AV_LOG_ERROR, "Line %d: failed to parse metadata string\n", line);
+                FAIL(AVERROR_INVALIDDATA);
+            }
+            av_log(avf, AV_LOG_WARNING,
+                   "'file_packet_metadata key=value:key=value' is deprecated, "
+                   "use multiple 'file_packet_meta key value' instead\n");
+            av_freep(&arg_str[0]);
+            break;
+
+        case DIR_OPTION:
+            ret = av_dict_set(&file->options, arg_kw[0], arg_str[1], AV_DICT_DONT_STRDUP_VAL);
+            arg_str[1] = NULL;
+            if (ret < 0)
+                FAIL(ret);
+            break;
+
+        case DIR_STREAM:
+            stream = avformat_new_stream(avf, NULL);
+            if (!stream)
+                FAIL(AVERROR(ENOMEM));
+            break;
+
+        case DIR_EXSID:
+            stream->id = arg_int[0];
+            break;
+        case DIR_STMETA:
+            ret = av_dict_set(&stream->metadata, arg_kw[0], arg_str[1], AV_DICT_DONT_STRDUP_VAL);
+            arg_str[1] = NULL;
+            if (ret < 0)
+                FAIL(ret);
+            break;
+
+        case DIR_STCODEC: {
+            const AVCodecDescriptor *codec = avcodec_descriptor_get_by_name(arg_kw[0]);
+            if (!codec) {
+                av_log(avf, AV_LOG_ERROR, "Line %d: codec '%s' not found\n", line, arg_kw[0]);
+                FAIL(AVERROR_DECODER_NOT_FOUND);
+            }
+            stream->codecpar->codec_type = codec->type;
+            stream->codecpar->codec_id = codec->id;
+            break;
+        }
+
+        case DIR_STEDATA: {
+            int size = ff_hex_to_data(NULL, arg_kw[0]);
+            ret = ff_alloc_extradata(stream->codecpar, size);
+            if (ret < 0)
+                FAIL(ret);
+            ff_hex_to_data(stream->codecpar->extradata, arg_kw[0]);
+            break;
+        }
+
+        case DIR_CHAPTER:
+            chapter = avpriv_new_chapter(avf, arg_int[0], AV_TIME_BASE_Q,
+                                         arg_int[1], arg_int[2], NULL);
+            if (!chapter)
+                FAIL(ENOMEM);
+            break;
+
+        default:
+            FAIL(AVERROR_BUG);
+        }
     }
-    if (ret != AVERROR_EOF && ret < 0)
+
+    if (!file) {
+        ret = AVERROR_INVALIDDATA;
         goto fail;
-    if (!cat->nb_files)
-        FAIL(AVERROR_INVALIDDATA);
+    }
+
+    if (file->inpoint != AV_NOPTS_VALUE && file->outpoint != AV_NOPTS_VALUE) {
+        if (file->inpoint  > file->outpoint ||
+            file->outpoint - (uint64_t)file->inpoint > INT64_MAX)
+            ret = AVERROR_INVALIDDATA;
+    }
+
+fail:
+    for (arg = 0; arg < MAX_ARGS; arg++)
+        av_freep(&arg_str[arg]);
+    av_bprint_finalize(&bp, NULL);
+    return ret == AVERROR_EOF ? 0 : ret;
+}
+
+static int concat_read_header(AVFormatContext *avf)
+{
+    ConcatContext *cat = avf->priv_data;
+    int64_t time = 0;
+    unsigned i;
+    int ret;
+
+    ret = concat_parse_script(avf);
+    if (ret < 0)
+        return ret;
+    if (!cat->nb_files) {
+        av_log(avf, AV_LOG_ERROR, "No files to concat\n");
+        return AVERROR_INVALIDDATA;
+    }
 
     for (i = 0; i < cat->nb_files; i++) {
         if (cat->files[i].start_time == AV_NOPTS_VALUE)
             cat->files[i].start_time = time;
         else
             time = cat->files[i].start_time;
-        if (cat->files[i].duration == AV_NOPTS_VALUE) {
-            if (cat->files[i].inpoint == AV_NOPTS_VALUE || cat->files[i].outpoint == AV_NOPTS_VALUE)
+        if (cat->files[i].user_duration == AV_NOPTS_VALUE) {
+            if (cat->files[i].inpoint == AV_NOPTS_VALUE || cat->files[i].outpoint == AV_NOPTS_VALUE ||
+                cat->files[i].outpoint - (uint64_t)cat->files[i].inpoint != av_sat_sub64(cat->files[i].outpoint, cat->files[i].inpoint)
+            )
                 break;
-            cat->files[i].duration = cat->files[i].outpoint - cat->files[i].inpoint;
+            cat->files[i].user_duration = cat->files[i].outpoint - cat->files[i].inpoint;
         }
-        time += cat->files[i].duration;
+        cat->files[i].duration = cat->files[i].user_duration;
+        if (time + (uint64_t)cat->files[i].user_duration > INT64_MAX)
+            return AVERROR_INVALIDDATA;
+        time += cat->files[i].user_duration;
     }
     if (i == cat->nb_files) {
         avf->duration = time;
@@ -545,14 +701,9 @@ static int concat_read_header(AVFormatContext *avf, AVDictionary **options)
     cat->stream_match_mode = avf->nb_streams ? MATCH_EXACT_ID :
                                                MATCH_ONE_TO_ONE;
     if ((ret = open_file(avf, 0)) < 0)
-        goto fail;
-    av_bprint_finalize(&bp, NULL);
-    return 0;
+        return ret;
 
-fail:
-    av_bprint_finalize(&bp, NULL);
-    concat_read_close(avf);
-    return ret;
+    return 0;
 }
 
 static int open_next_file(AVFormatContext *avf)
@@ -560,14 +711,7 @@ static int open_next_file(AVFormatContext *avf)
     ConcatContext *cat = avf->priv_data;
     unsigned fileno = cat->cur_file - cat->files;
 
-    if (cat->cur_file->duration == AV_NOPTS_VALUE) {
-        if (cat->avf->duration > 0 || cat->cur_file->next_dts == AV_NOPTS_VALUE) {
-            cat->cur_file->duration = cat->avf->duration;
-        } else {
-            cat->cur_file->duration = cat->cur_file->next_dts;
-        }
-        cat->cur_file->duration -= (cat->cur_file->file_inpoint - cat->cur_file->file_start_time);
-    }
+    cat->cur_file->duration = get_best_effort_duration(cat->cur_file, cat->avf);
 
     if (++fileno >= cat->nb_files) {
         cat->eof = 1;
@@ -585,7 +729,6 @@ static int filter_packet(AVFormatContext *avf, ConcatStream *cs, AVPacket *pkt)
         if (ret < 0) {
             av_log(avf, AV_LOG_ERROR, "h264_mp4toannexb filter "
                    "failed to send input packet\n");
-            av_packet_unref(pkt);
             return ret;
         }
 
@@ -611,7 +754,6 @@ static int packet_after_outpoint(ConcatContext *cat, AVPacket *pkt)
     return 0;
 }
 
-#define CONCAT_MAX_OPEN_TRY 3
 static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
 {
     ConcatContext *cat = avf->priv_data;
@@ -619,13 +761,7 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
     int64_t delta;
     ConcatStream *cs;
     AVStream *st;
-    int try_counter = 0;
-    int is_new_st = 0;
-
-    if (cat->error) {
-        ret = cat->error;
-        return ret;
-    }
+    FFStream *sti;
 
     if (cat->eof)
         return AVERROR_EOF;
@@ -636,28 +772,19 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
     while (1) {
         ret = av_read_frame(cat->avf, pkt);
         if (ret == AVERROR_EOF) {
-            is_new_st = 1;
             if ((ret = open_next_file(avf)) < 0)
-                goto open_fail;
+                return ret;
             continue;
         }
-        if (ret < 0) {
-            if (avf->pb && cat->avf->pb)
-                avf->pb->error = cat->avf->pb->error;
+        if (ret < 0)
             return ret;
-        }
-        if (is_new_st) {
-            pkt->flags |= AV_PKT_FLAG_NEW_SEG;
-            is_new_st = 0;
-        }
         if ((ret = match_streams(avf)) < 0) {
-            av_packet_unref(pkt);
             return ret;
         }
         if (packet_after_outpoint(cat, pkt)) {
             av_packet_unref(pkt);
             if ((ret = open_next_file(avf)) < 0)
-                goto open_fail;
+                return ret;
             continue;
         }
         cs = &cat->cur_file->streams[pkt->stream_index];
@@ -666,21 +793,12 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
             continue;
         }
         break;
-open_fail:
-        ++try_counter;
-        if (try_counter > CONCAT_MAX_OPEN_TRY) {
-            cat->error = ret;
-            if (avf->pb && ret != AVERROR_EOF)
-               avf->pb->error = ret;
-            return AVERROR_EOF;
-        }
-
-        av_log(avf, AV_LOG_WARNING, "open_next_file() failed (%d)\n", try_counter);
     }
-    if ((ret = filter_packet(avf, cs, pkt)))
+    if ((ret = filter_packet(avf, cs, pkt)) < 0)
         return ret;
 
     st = cat->avf->streams[pkt->stream_index];
+    sti = ffstream(st);
     av_log(avf, AV_LOG_DEBUG, "file:%d stream:%d pts:%s pts_time:%s dts:%s dts_time:%s",
            (unsigned)(cat->cur_file - cat->files), pkt->stream_index,
            av_ts2str(pkt->pts), av_ts2timestr(pkt->pts, &st->time_base),
@@ -697,38 +815,27 @@ open_fail:
            av_ts2str(pkt->pts), av_ts2timestr(pkt->pts, &st->time_base),
            av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &st->time_base));
     if (cat->cur_file->metadata) {
-        uint8_t* metadata;
-        int metadata_len;
+        size_t metadata_len;
         char* packed_metadata = av_packet_pack_dictionary(cat->cur_file->metadata, &metadata_len);
         if (!packed_metadata)
             return AVERROR(ENOMEM);
-        if (!(metadata = av_packet_new_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA, metadata_len))) {
+        ret = av_packet_add_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA,
+                                      packed_metadata, metadata_len);
+        if (ret < 0) {
             av_freep(&packed_metadata);
-            return AVERROR(ENOMEM);
+            return ret;
         }
-        memcpy(metadata, packed_metadata, metadata_len);
-        av_freep(&packed_metadata);
     }
 
-    if (cat->cur_file->duration == AV_NOPTS_VALUE && st->cur_dts != AV_NOPTS_VALUE) {
-        int64_t next_dts = av_rescale_q(st->cur_dts, st->time_base, AV_TIME_BASE_Q);
+    if (cat->cur_file->duration == AV_NOPTS_VALUE && sti->cur_dts != AV_NOPTS_VALUE) {
+        int64_t next_dts = av_rescale_q(sti->cur_dts, st->time_base, AV_TIME_BASE_Q);
         if (cat->cur_file->next_dts == AV_NOPTS_VALUE || next_dts > cat->cur_file->next_dts) {
             cat->cur_file->next_dts = next_dts;
         }
     }
 
     pkt->stream_index = cs->out_stream_index;
-    return ret;
-}
-
-static void rescale_interval(AVRational tb_in, AVRational tb_out,
-                             int64_t *min_ts, int64_t *ts, int64_t *max_ts)
-{
-    *ts     = av_rescale_q    (*    ts, tb_in, tb_out);
-    *min_ts = av_rescale_q_rnd(*min_ts, tb_in, tb_out,
-                               AV_ROUND_UP   | AV_ROUND_PASS_MINMAX);
-    *max_ts = av_rescale_q_rnd(*max_ts, tb_in, tb_out,
-                               AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
+    return 0;
 }
 
 static int try_seek(AVFormatContext *avf, int stream,
@@ -743,8 +850,8 @@ static int try_seek(AVFormatContext *avf, int stream,
     if (stream >= 0) {
         if (stream >= cat->avf->nb_streams)
             return AVERROR(EIO);
-        rescale_interval(AV_TIME_BASE_Q, cat->avf->streams[stream]->time_base,
-                         &min_ts, &ts, &max_ts);
+        ff_rescale_interval(AV_TIME_BASE_Q, cat->avf->streams[stream]->time_base,
+                            &min_ts, &ts, &max_ts);
     }
     return avformat_seek_file(cat->avf, stream, min_ts, ts, max_ts, flags);
 }
@@ -758,12 +865,19 @@ static int real_seek(AVFormatContext *avf, int stream,
     if (stream >= 0) {
         if (stream >= avf->nb_streams)
             return AVERROR(EINVAL);
-        rescale_interval(avf->streams[stream]->time_base, AV_TIME_BASE_Q,
-                         &min_ts, &ts, &max_ts);
+        ff_rescale_interval(avf->streams[stream]->time_base, AV_TIME_BASE_Q,
+                            &min_ts, &ts, &max_ts);
     }
 
     left  = 0;
     right = cat->nb_files;
+
+    /* Always support seek to start */
+    if (ts <= 0)
+        right = 1;
+    else if (!cat->seekable)
+        return AVERROR(ESPIPE); /* XXX: can we use it? */
+
     while (right - left > 1) {
         int mid = (left + right) / 2;
         if (ts < cat->files[mid].start_time)
@@ -800,11 +914,6 @@ static int concat_seek(AVFormatContext *avf, int stream,
     AVFormatContext *cur_avf_saved = cat->avf;
     int ret;
 
-    /* reset error/complete state */
-    cat->error = 0;
-
-    if (!cat->seekable)
-        return AVERROR(ESPIPE); /* XXX: can we use it? */
     if (flags & (AVSEEK_FLAG_BYTE | AVSEEK_FLAG_FRAME))
         return AVERROR(ENOSYS);
     cat->avf = NULL;
@@ -829,7 +938,7 @@ static int concat_seek(AVFormatContext *avf, int stream,
 
 static const AVOption options[] = {
     { "safe", "enable safe mode",
-      OFFSET(safe), AV_OPT_TYPE_BOOL, {.i64 = 1}, -1, 1, DEC },
+      OFFSET(safe), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, DEC },
     { "auto_convert", "automatically convert bitstream format",
       OFFSET(auto_convert), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, DEC },
     { "segment_time_metadata", "output file segment start time and duration as packet metadata",
@@ -845,12 +954,13 @@ static const AVClass concat_class = {
 };
 
 
-AVInputFormat ff_concat_demuxer = {
+const AVInputFormat ff_concat_demuxer = {
     .name           = "concat",
     .long_name      = NULL_IF_CONFIG_SMALL("Virtual concatenation script"),
     .priv_data_size = sizeof(ConcatContext),
+    .flags_internal = FF_FMT_INIT_CLEANUP,
     .read_probe     = concat_probe,
-    .read_header2   = concat_read_header,
+    .read_header    = concat_read_header,
     .read_packet    = concat_read_packet,
     .read_close     = concat_read_close,
     .read_seek2     = concat_seek,
